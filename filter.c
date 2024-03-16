@@ -136,7 +136,6 @@ struct filter_in *create_filter_input(int const L,int const M, enum filtertype c
   // of independent FFTs to execute at the same time
   if(!FFTW_init){
     fftwf_init_threads();
-    pthread_mutex_init(&FFTW_planning_mutex,NULL);
     bool sr = fftwf_import_system_wisdom();
     fprintf(stdout,"fftwf_import_system_wisdom() %s\n",sr ? "succeeded" : "failed");
     if(!sr){
@@ -350,7 +349,6 @@ int execute_filter_input(struct filter_in * const f){
   // We use the FFTW3 functions that specify the input and output arrays
   // Execute the FFT in separate worker threads
   struct fft_job * const job = calloc(1,sizeof(struct fft_job));
-  pthread_mutex_init(job->completion_mutex,NULL);
   job->jobnum = f->next_jobnum++;
   job->output = f->fdomain[job->jobnum % ND];
   job->type = f->in_type;
