@@ -36,4 +36,7 @@ tune
 wd-record
 wspr-decoded
 docs/notes
-
+docs/monitor-screenshot.png
+stash/*
+igate
+powerlogger
