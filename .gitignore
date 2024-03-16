@@ -41,4 +41,7 @@ wd-record
 work
 wspr-decoded
 docs/notes
-
+docs/monitor-screenshot.png
+stash/*
+igate
+powerlogger
