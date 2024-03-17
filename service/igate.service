@@ -15,7 +15,7 @@ ExecStartPre=/bin/touch /var/log/igate.log
 ExecStartPre=/bin/chown igate /var/log/igate.log
 # set CALL and SERVER in /etc/radio/aprs.conf
 EnvironmentFile=/etc/radio/igate.conf
-ExecStart=/usr/local/sbin/igate -I $AX25 -u $CALL -h $SERVER -f /var/log/igate.log -L $LAT -G $LON -A $ALT -S $SYMBOL -O $OVERLAY -C "${COMMENT}"
+ExecStart=/usr/local/sbin/igate -I $AX25 -u $CALL -h $SERVER -f /var/log/igate.log -L $LAT -G $LON -A $ALT -S $SYMBOL -O $OVERLAY -B $BEACONING -C "${COMMENT}"
 Restart=always
 RestartSec=5
 TimeoutStopSec=5
