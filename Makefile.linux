@@ -82,7 +82,7 @@ igate: igate.o ax25.o libradio.a
 
 
 control: control.o modes.o bandplan.o libradio.a
-	$(CC) $(LDOPTS) -o $@ $^ -lfftw3f_threads -lfftw3f -lncursesw -liniparser -lbsd -lm -lpthread
+	$(CC) $(LDOPTS) -o $@ $^ -lavahi-client -lavahi-common -lfftw3f_threads -lfftw3f -lncursesw -liniparser -lbsd -lm -lpthread
 
 cwd: cwd.o morse.o libradio.a
 	$(CC) $(LDOPTS) -o $@ $^ -lbsd -lm -lpthread
