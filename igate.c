@@ -20,13 +20,14 @@
 #else
 #include <string.h>
 #endif
+#include <signal.h>
 #include <sysexits.h>
 
 #include "multicast.h"
 #include "ax25.h"
 #include "misc.h"
 
-// structures for APRS telemetry data
+// structures for APRS telemetry data and station particulars
 // ---------------------------------------------------------------------
 typedef struct {
     int a;
@@ -39,6 +40,16 @@ typedef struct {
     APRS_COEF drp;
     APRS_COEF rxsat;
 } APRS_EQNS;
+
+typedef struct {
+    float lat;
+    float lon;
+    float alt;
+    char symbol[3];  // character representing the symbol
+    char overlay[3]; // character representing the char to be overlaid on top of the symbol
+    char comment[186]; // max APRS information field length is 256 bytes. That minus normal position packet length (ex. 70 bytes), leaves 186 bytes for "everything else" like the station comment.
+} APRS_STATION;
+
 // ---------------------------------------------------------------------
 
 
@@ -54,6 +65,10 @@ char *Latitude;
 char *Longitude;
 char *Altitude;
 char *Comment;
+char *Beaconing = "0";
+
+// max packet size for position packets (actually the max size is 256 - 70 = 186, but backing this off by 8 bytes for a little buffer room)
+static int MAX_POSIT = 178;
 
 // By default, when beaconing to APRS-IS, we represent this station as an Rx-only Igate.
 char *Symbol = "&";
@@ -64,7 +79,7 @@ int dropped_pkts = 0;
 int received_pkts = 0;
 int received_sat_pkts = 0;
 
-// APRS telemetry sequence number
+// Starting APRS telemetry sequence number.  According to APRS this should increment by 1 for each batch of telemetry data sent.
 int sequence = 0;
 
 // APRS tocall value.  Experimental tocalls start with APZxxx.  Using "KR1" for "KA9Q-Radio 1".  Dunno...just making this up.  ;)
@@ -72,15 +87,27 @@ char *tocall = "APZKR1";
 
 // By default beaconing to APRS-IS is not enabled.
 bool beaconing_enabled = false;
-char info_string[128];
 
+// station information
+APRS_STATION aprs_station;
+char info_string[256];
+
+// logfile and application name
 FILE *Logfile;
 const char *App_path;
+
+// Verbosity level
 int Verbose;
 
+// File descriptors
 int Input_fd = -1;
 int Network_fd = -1;
+
+// The global variable that processing loops check.  If this is set to "true", then processing loops should end.
+bool stop_processing = false;
+
 // ---------------------------------------------------------------------
+
 
 // Thread mutex, conditions, and threads
 // ---------------------------------------------------------------------
@@ -105,6 +132,9 @@ int parampacket(char *buffer, size_t n);
 int eqnpacket(char *buffer, size_t n, APRS_EQNS *eqns);
 int calculatecoef(int value, APRS_COEF *c);
 int telemetrypacket(char *buffer, size_t n, APRS_EQNS *eqns);
+int createinfostring(char *buffer, size_t n, APRS_STATION *station);
+void initstation(APRS_STATION *station);
+void closedown(int x);
 // ---------------------------------------------------------------------
 
 
@@ -124,8 +154,16 @@ int main(int argc,char *argv[])
     setlocale(LC_ALL,getenv("LANG"));
     setlinebuf(stdout);
 
+    // capture any sort of kill/close conditions.  Mostly so we can cleanly exit
+    signal(SIGPIPE, closedown);
+    signal(SIGINT, closedown);
+    signal(SIGKILL, closedown);
+    signal(SIGQUIT, closedown);
+    signal(SIGTERM, closedown);
+
+    // Parse through command line arguments
     int c;
-    while((c = getopt(argc,argv,"u:p:I:vh:f:L:G:A:S:O:C:V:")) != EOF) {
+    while((c = getopt(argc,argv,"u:p:I:vh:f:L:G:A:S:O:C:V:B:")) != EOF) {
         switch(c) {
             case 'f':
                 Logfilename = optarg;
@@ -165,11 +203,14 @@ int main(int argc,char *argv[])
             case 'O':
                 Overlay = optarg;
                 break;
+            case 'B':
+                Beaconing = optarg;
+                break;
             case 'V':
                 VERSION();
                 exit(EX_OK);
             default:
-                fprintf(stderr,"Usage: %s -u user [-p passcode] [-v] [-I mcast_address][-h host] [-L latitude] [-G longitude] [-A altitude] [-C comment string] [-S symbol char] [-O overlay char]\n",argv[0]);
+                fprintf(stderr,"Usage: %s -u user [-p passcode] [-v] [-I mcast_address][-h host] [-L latitude] [-G longitude] [-A altitude] [-C comment string] [-S symbol char] [-O overlay char] [-B 0|1]\n",argv[0]);
                 exit(EX_USAGE);
         }
     }
@@ -224,73 +265,48 @@ int main(int argc,char *argv[])
         }
     }
 
-    // print out particulars about the command line arguments used and determine if we're beaconing
-    if (Latitude && Longitude && Altitude && Symbol && Overlay && Comment) {
+    // initialize our station details
+    initstation(&aprs_station);
 
-        // print out some info
-        fprintf(Logfile, "%s invoked with latitude=%s, longitude=%s, altitude=%s, symbol=%s, overlay=%s, comment=%s\n", argv[0], Latitude, Longitude, Altitude, Symbol, Overlay, Comment);
+    // Check if beaconing was enabled
+    if (Beaconing) {
+        int b = atoi(Beaconing);
 
-        // convert values to floating points
-        float lat = atof(Latitude);
-        float lon = atof(Longitude);
-        int alt = atoi(Altitude);
+        if (b > 0 && Latitude && Longitude && Altitude && Symbol && Overlay && Comment) {
 
-        fprintf(Logfile, "Location of this station: %.4f, %.4f at %d\n", lat, lon, alt);
+            // populate this station's details
+            aprs_station.lat = atof(Latitude);
+            aprs_station.lon = atof(Longitude);
+            aprs_station.alt = atof(Altitude);
+            strncpy(aprs_station.symbol, Symbol, sizeof(aprs_station.symbol)-1);
+            strncpy(aprs_station.overlay, Overlay, sizeof(aprs_station.overlay)-1);
+            strncpy(aprs_station.comment, Comment, sizeof(aprs_station.comment)-1);
 
-        // convert the lat/lon to degrees, decimal minutes
-        char lat_ns;
-        char lon_ew;
-        if (lat >= 0)
-            lat_ns = 'N';
-        else
-            lat_ns = 'S';
-
-        if (lon >= 0)
-            lon_ew = 'E';
-        else
-            lon_ew = 'W';
-
-        // remove any negative degrees
-        lat = (lat < 0 ? -lat : lat);
-        lon = (lon < 0 ? -lon : lon);
-
-        // just the degrees
-        int lat_d = (int) lat;
-        int lon_d = (int) lon;
-
-        // the decimal minutes
-        float lat_ms = (lat - lat_d) * 60;
-        float lon_ms = (lon - lon_d) * 60;
-
-        // the latitude and longitude strings
-        char lat_string[20];
-        char lon_string[20];
-        memset(lat_string, 0, sizeof(lat_string));
-        memset(lon_string, 0, sizeof(lon_string));
-        snprintf(lat_string, sizeof(lat_string), "%02d%05.2f%c", lat_d, lat_ms, lat_ns);
-        snprintf(lon_string, sizeof(lon_string), "%03d%05.2f%c", lon_d, lon_ms, lon_ew);
-
-        // Create the position string used in the posit beacon text.
-        // for APRS, the position report represents latitude as ddmm.ssN or ddmm.ssS
-        // for APRS, the position report represents longitude as dddmm.ssWor dddmm.ssE
-        memset(info_string, 0, sizeof(info_string));
-        int num = snprintf(info_string, sizeof(info_string), "%s%s%s%s/A=%06d%s", lat_string, Overlay, lon_string, Symbol, alt, Comment);
-
-        if (num > 128) {
-            beaconing_enabled = false;
-            fprintf(stderr, "Position string for APRS-IS beaconing was too long:  %s\n", info_string);
-            fprintf(stderr, "APRS-IS beaconing disabled.\n");
-        } else {
-
-            // Finally we enable beaconing if all the above variable have been properly set.
-            beaconing_enabled = true;
-
+            memset(info_string, 0, sizeof(info_string));
+            if(createinfostring(info_string, sizeof(info_string), &aprs_station) <= 0) {
+                beaconing_enabled = false;
+            }
+            else {
+                // print out some info
+                fprintf(Logfile, "%s invoked with latitude=%s, longitude=%s, altitude=%s, symbol=%s, overlay=%s, comment=%s\n", argv[0], Latitude, Longitude, Altitude, Symbol, Overlay, Comment);
+                fprintf(Logfile, "Location of this station: %.4f, %.4f at %d\n", aprs_station.lat, aprs_station.lon, (int) aprs_station.alt);
+                fprintf(Logfile, "Beaconing enabled.\n");
+            }
         }
+    }
+    else {
+        beaconing_enabled = false;
     }
 
 
-    while(true) {
-        // Resolve the APRS network server
+    // Basically loop until we're supposed stop
+    while(!stop_processing) {
+
+        // -----------------------------------
+        // start:  resolve and connect to aprs-is server
+        //
+        // Resolve and connect to the APRS network server
+        
         struct addrinfo hints;
         memset(&hints,0,sizeof(hints));
         hints.ai_family = PF_UNSPEC;
@@ -300,17 +316,20 @@ int main(int argc,char *argv[])
 
         struct addrinfo *results = NULL;
         int ecode;
+
         // Try a few times in case we come up before the resolver is quite ready
         for(int tries=0; tries < 10; tries++) {
             if((ecode = getaddrinfo(Host,Port,&hints,&results)) == 0)
                 break;
             usleep(500000); // 500 ms
         }
+
         if(ecode != 0) {
             fprintf(stderr,"Can't getaddrinfo(%s,%s): %s\n",Host,Port,gai_strerror(ecode));
             usleep(5000000); // 5 sec
             continue; // Keep trying
         }
+
         struct addrinfo *resp;
         for(resp = results; resp != NULL; resp = resp->ai_next) {
             if((Network_fd = socket(resp->ai_family,resp->ai_socktype,resp->ai_protocol)) < 0)
@@ -320,6 +339,7 @@ int main(int argc,char *argv[])
             close(Network_fd);
             Network_fd = -1;
         }
+
         if(resp == NULL) {
             fprintf(stderr,"Can't connect to server %s:%s\n",Host,Port);
             sleep(600); // 5 minutes
@@ -327,6 +347,10 @@ int main(int argc,char *argv[])
             resp = results = NULL;
             continue;
         }
+
+        // end:  resolve and connect to aprs-is server
+        // --------------------------------------
+
         if(Logfile)
             fprintf(Logfile,"Connected to APRS server %s port %s\n",resp->ai_canonname,Port);
 
@@ -336,20 +360,26 @@ int main(int argc,char *argv[])
         FILE *network = fdopen(Network_fd,"w+");
         setlinebuf(network);
 
+        // start two threads:  1) a thread to read from the APRS-IS server, 2) Beaconing thread that will beacon position (maybe...if beaconing_enabled = true) and telemetry packets to the APRS-IS server
         pthread_create(&Read_thread,NULL,netreader,NULL);
         pthread_create(&Beacon_thread,NULL,beaconthread,NULL);
 
-        // Log into the network
+        // Log into the APRS-IS server 
         if(fprintf(network,"user %s pass %s vers KA9Q-aprs 1.0\r\n",User,Passcode) <= 0) {
-            // error
+
+            // if there was error, then we close our connection, sleep for 5mins, then restart this outer 'while loop' back at the beginning.
             fclose(network);
             network = NULL;
             sleep(600); // 5 minutes;
             continue;
         }
+
+
         uint8_t packet[PKTSIZE];
         int size;
-        while((size = recv(Input_fd,packet,sizeof(packet),0)) > 0) {
+
+        // loop until we no longer are receiving data from the multicast address or we've been signaled to stop processing
+        while((size = recv(Input_fd,packet,sizeof(packet),0)) > 0 && !stop_processing) {
             struct rtp_header rtp_header;
             uint8_t const *dp = packet;
 
@@ -368,6 +398,7 @@ int main(int argc,char *argv[])
             if(rtp_header.type != AX25_pt)
                 continue; // Wrong type
 
+            // print the start of a log message.  this includes timestamp, etc..but no newline...as that'll be written down below...
             if(Logfile) {
                 // Emit local timestamp
                 char result[1024];
@@ -387,6 +418,7 @@ int main(int argc,char *argv[])
                 dropped_pkts++;
                 pthread_mutex_unlock(&stats_lock);
 
+                // restart at the beginning of this inner loop as this was an unparsable AX25 frame
                 continue;
             }
 
@@ -395,6 +427,9 @@ int main(int argc,char *argv[])
             int sspace = sizeof(monstring);
             int infolen = 0;
             int is_tcpip = 0;
+
+
+            // ------------------- start:  process the incoming packet ---------------
             {
                 memset(monstring,0,sizeof(monstring));
                 char *cp = monstring;
@@ -436,10 +471,17 @@ int main(int argc,char *argv[])
                 *cp++ = '\0';
                 sspace--;
             }
+            // ------------------- end:  process the incoming packet ---------------
+
+
+            // make sure there wasn't something odd happening with the buffers
             assert(sizeof(monstring) - sspace - 1 == strlen(monstring));
+
+            // print the rest of the log message
             if(Logfile)
                 fprintf(Logfile," %s\n",monstring);
 
+            // ------------------- start:  check for drop conditions ---------------
             if(frame.control != 0x03 || frame.type != 0xf0) {
                 if(Logfile)
                     fprintf(Logfile," Not relaying: invalid ax25 ctl/protocol\n");
@@ -480,6 +522,7 @@ int main(int argc,char *argv[])
 
                 continue;
             }
+            // ------------------- end:  check for drop conditions ---------------
 
             pthread_mutex_lock(&stats_lock);
             received_pkts++;
@@ -488,10 +531,12 @@ int main(int argc,char *argv[])
             pthread_mutex_unlock(&stats_lock);
 
             int ret;
+
             // Send to APRS network with appended crlf
             pthread_mutex_lock(&tcp_lock);
             ret = fprintf(network,"%s\r\n",monstring);
             pthread_mutex_unlock(&tcp_lock);
+
             if (ret <= 0) {
                 // error!
                 fclose(network);
@@ -501,22 +546,25 @@ int main(int argc,char *argv[])
         }
 retry:
         ;
+
+        // close the threads
         pthread_cancel(Read_thread);
         pthread_join(Read_thread,NULL);
         pthread_cancel(Beacon_thread);
         pthread_join(Beacon_thread,NULL);
     }
+
+    if (Logfile)
+        fprintf(Logfile, "Done.\n");
 }
+
 
 // ---------------------------------------------------------------------
 // ---------------------------------------------------------------------
-// Just read and echo responses from server
+// Just read and echo responses from the APRS-IS server
 void *netreader(void *arg)
 {
     pthread_setname("aprs-read");
-
-    // lock the beacon_lock
-    //pthread_mutex_lock(&beacon_lock);
 
     char *line = NULL;
     size_t linecap = 0;
@@ -548,11 +596,43 @@ void *netreader(void *arg)
     return NULL;
 }
 
+
+// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// Initialize station structure
+void initstation(APRS_STATION *station)
+{
+    station->lat = 0;
+    station->lon = 0;
+    station->alt = 0;
+    memset(station->symbol, 0, sizeof(station->symbol));
+    memset(station->overlay, 0, sizeof(station->overlay));
+    memset(station->comment, 0, sizeof(station->comment));
+}
+
+
+// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// Shutdown the application.  Should be called from kill signals.
+void closedown(int x)
+{
+    if (Verbose)
+        fprintf(stdout, "\nStopping app...\n");
+
+    // Set the global to true so that processing loops close down
+    stop_processing = true;
+
+    // Sleep for 1 second to allow other threads to close down
+    sleep(1);
+}
+
+
 // ---------------------------------------------------------------------
 // ---------------------------------------------------------------------
 // Construct a packet string for beaconing our position, symbol, and comment.
 int positpacket(char *buffer, size_t n)
 {
+    // sanity check
     if (buffer == NULL)
         return 0;
 
@@ -579,17 +659,23 @@ int telemetrypacket(char *buffer, size_t n, APRS_EQNS *eqns)
     int adjusted_dropped;
     int adjusted_receive_sat;
 
+    // sanity check
     if (buffer == NULL)
         return 0;
 
-    // get the received and dropped packet values, then reset them back to zero
+    // lock on the stats mutex
     pthread_mutex_lock(&stats_lock);
+
+    // save the received and dropped packet values to local variables, then reset them back to zero
     received = received_pkts;
     dropped = dropped_pkts;
     received_sat = received_sat_pkts;
     received_pkts = 0;
     dropped_pkts = 0;
     received_sat_pkts = 0;
+
+
+    // unlock the stats mutex
     pthread_mutex_unlock(&stats_lock);
 
     // Determine coefficients for the APRS equations packet.  We do this because telemetry values can only range from 0-255.
@@ -597,7 +683,7 @@ int telemetrypacket(char *buffer, size_t n, APRS_EQNS *eqns)
     adjusted_dropped = calculatecoef(dropped, &(eqns->drp));
     adjusted_receive_sat = calculatecoef(received_sat, &(eqns->rxsat));
 
-    // return the telemetry packet as a string
+    // write the telemetry packet string to the supplied buffer.
     num = snprintf(buffer, n, "%s>%s,TCPIP*:T#%03d,%03d,%03d,%03d,%03d,%03d,00000000,Telemetry report", User, tocall, sequence, adjusted_receive, adjusted_dropped, adjusted_receive_sat, 0, 0);
 
     // check the sequence number.  If > 999, then we roll it back to 000.
@@ -605,10 +691,70 @@ int telemetrypacket(char *buffer, size_t n, APRS_EQNS *eqns)
     if (sequence > 999 || sequence < 0)
         sequence = 0;
 
-
     return num;
 
 }
+
+
+// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// for a given set of station details, fill a buffer with the constructed information string (as part of an APRS packet)
+int createinfostring(char *buffer, size_t n, APRS_STATION *station)
+{
+    float local_lat, local_lon, lat_ms, lon_ms;
+    int lat_d, lon_d, infosize, num;
+    char lat_ns;
+    char lon_ew;
+    char lat_string[20];
+    char lon_string[20];
+
+    // convert the lat/lon to degrees, decimal minutes
+    if (station->lat >= 0)
+        lat_ns = 'N';
+    else
+        lat_ns = 'S';
+
+    if (station->lon >= 0)
+        lon_ew = 'E';
+    else
+        lon_ew = 'W';
+
+    // remove any negative degrees
+    local_lat = (station->lat < 0 ? -station->lat : station->lat);
+    local_lon = (station->lon < 0 ? -station->lon : station->lon);
+
+    // just the degrees (truncate off the decimal portion)
+    lat_d = (int) local_lat;
+    lon_d = (int) local_lon;
+
+    // the decimal minutes
+    lat_ms = (local_lat - lat_d) * 60;
+    lon_ms = (local_lon - lon_d) * 60;
+
+    // the latitude and longitude strings
+    memset(lat_string, 0, sizeof(lat_string));
+    memset(lon_string, 0, sizeof(lon_string));
+
+    // For APRS, the position report represents latitude as ddmm.ssN or ddmm.ssS
+    // For APRS, the position report represents longitude as dddmm.ssWor dddmm.ssE
+    snprintf(lat_string, sizeof(lat_string), "%02d%05.2f%c", lat_d, lat_ms, lat_ns);
+    snprintf(lon_string, sizeof(lon_string), "%03d%05.2f%c", lon_d, lon_ms, lon_ew);
+
+
+    // Determine if the buffer is shorter than the maximum size for a position report packet
+    if (n > MAX_POSIT)
+        infosize = MAX_POSIT;
+    else
+        infosize = n;
+
+    // Create the information string, saved to the buffer.  If the comment string is too long, then that is truncated at the 'infosize' mark.
+    num = snprintf(buffer, infosize, "%s%s%s%s/A=%06d%s", lat_string, station->overlay, lon_string, station->symbol, (int) station->alt, station->comment);
+
+    // return the number of bytes written to the buffer
+    return num;
+}
+
+
 
 // ---------------------------------------------------------------------
 // ---------------------------------------------------------------------
@@ -688,16 +834,20 @@ void *beaconthread(void *arg)
 {
     pthread_setname("beacon-thread");
 
-    char packet_string[256];
+    // Buffer where we save the position packet that we "might" beacon to the APRS-IS server.
+    char packet_string[332]; // the maximum size of an AX.25 UI frame is 332 bytes.
     int ret = 1;
 
-    // This is the number of seconds we wait in between sending beacons to the APRS-IS server.
+    // This is the number of seconds we wait in between sending packets to the APRS-IS server.
     int delta = 600;
 
     // Create our own stream; there seem to be problems sharing a common stream among threads
     FILE *network = fdopen(Network_fd,"w");
     setlinebuf(network);
 
+    // We don't want to conenct to the APRS-IS server until our connection to that server was successful.  So we wait until the reader thread has received confirmation from the APRS-IS server and has 
+    // signaled that we can continue.
+    
     // Attempt to get the beacon_lock that signifies that we can proceed with transmitting our beacons to the APRS-IS servers
     pthread_mutex_lock(&beacon_lock);
 
@@ -707,57 +857,66 @@ void *beaconthread(void *arg)
     // unlock as we're now clear to xmit to the APRS-IS server
     pthread_mutex_unlock(&beacon_lock);
 
-    // Loop until we can't send data to the APRS-IS server
-    while(ret > 0) {
+    // Loop until we can't send data (i.e. something when wrong with talking to the APRS-IS server) or we've been told to stop
+    while(ret > 0 && !stop_processing) {
 
-        // check how long it's been since we last sent a beacon to the APRS-IS server
+        // if beaconing is enabled, then we are free to send position reports to the APRS-IS server about this station's location, symbol, overlay, comments, etc..
         if (beaconing_enabled) {
+
+            // create a position report packet string
             memset(packet_string, 0, sizeof(packet_string));
-            if (positpacket(packet_string, sizeof(packet_string))) {
-                char timestring[1024];
-                char eqns[256];
-                char params[256];
-                char units[256];
-                char bits[256];
-                char telem[256];
-                APRS_EQNS aprs_eqns;
+            positpacket(packet_string, sizeof(packet_string));
+        }
 
-                telemetrypacket(telem, sizeof(telem), &aprs_eqns);
-                eqnpacket(eqns, sizeof(eqns), &aprs_eqns);
-                parampacket(params, sizeof(params));
-                unitspacket(units, sizeof(units));
-                bitspacket(bits, sizeof(bits));
+        char timestring[1024];
+        char eqns[256];
+        char params[256];
+        char units[256];
+        char bits[256];
+        char telem[256];
+        APRS_EQNS aprs_eqns;
 
-                //printf("%s\n", telem);
-                //printf("%s\n", params);
-                //printf("%s\n", units);
-                //printf("%s\n", eqns);
-                //printf("%s\n", bits);
+        telemetrypacket(telem, sizeof(telem), &aprs_eqns);
+        eqnpacket(eqns, sizeof(eqns), &aprs_eqns);
+        parampacket(params, sizeof(params));
+        unitspacket(units, sizeof(units));
+        bitspacket(bits, sizeof(bits));
 
-                pthread_mutex_lock(&tcp_lock);
-                fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), packet_string);
-                fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), telem);
-                fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), eqns);
-                fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), params);
-                fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), units);
-                fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), bits);
-                ret = fprintf(network, "%s\r\n", packet_string);
-                if (ret)
-                    ret = fprintf(network, "%s\r\n", telem);
-                if (ret)
-                    ret = fprintf(network, "%s\r\n", eqns);
-                if (ret)
-                    ret = fprintf(network, "%s\r\n", params);
-                if (ret)
-                    ret = fprintf(network, "%s\r\n", units);
-                if (ret)
-                    ret = fprintf(network, "%s\r\n", bits);
-                pthread_mutex_unlock(&tcp_lock);
+        // locking the connection to the APRS-IS server.
+        pthread_mutex_lock(&tcp_lock);
 
-                if (ret <= 0 ) {
-                    fprintf(stderr, "beacon write error\n");
-                }
-            }
+        // we only send position packets if we've enable beaconing
+        if (beaconing_enabled) {
+            fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), packet_string);
+            ret = fprintf(network, "%s\r\n", packet_string);
+        }
+        else
+            ret = 1;
+
+        // we always send telemetry
+        fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), telem);
+        fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), eqns);
+        fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), params);
+        fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), units);
+        fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), bits);
+
+        if (ret)
+            ret = fprintf(network, "%s\r\n", telem);
+        if (ret)
+            ret = fprintf(network, "%s\r\n", eqns);
+        if (ret)
+            ret = fprintf(network, "%s\r\n", params);
+        if (ret)
+            ret = fprintf(network, "%s\r\n", units);
+        if (ret)
+            ret = fprintf(network, "%s\r\n", bits);
+
+        // Data written, now release our lock.
+        pthread_mutex_unlock(&tcp_lock);
+
+        // If there was an error in writing those packets to the APRS-IS server, then we report to stderr
+        if (ret <= 0 ) {
+            fprintf(stderr, "Error transmitting position or telemetry packets to the APRS-IS server.\n");
         }
 
         // sleep for delta secs
