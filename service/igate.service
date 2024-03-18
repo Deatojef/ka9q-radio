@@ -13,9 +13,14 @@ Type=simple
 PermissionsStartOnly=true
 ExecStartPre=/bin/touch /var/log/igate.log
 ExecStartPre=/bin/chown igate /var/log/igate.log
-# set CALL and SERVER in /etc/radio/aprs.conf
+
+# For aprs telemetry sequence
+ExecStartPre=/bin/touch /var/lib/ka9q-radio/telem-seq.txt
+ExecStartPre=/bin/chown igate /var/lib/ka9q-radio/telem-seq.txt
+
+# set CALL and SERVER and others in /etc/radio/igate.conf
 EnvironmentFile=/etc/radio/igate.conf
-ExecStart=/usr/local/sbin/igate -I $AX25 -u $CALL -h $SERVER -f /var/log/igate.log -L $LAT -G $LON -A $ALT -S $SYMBOL -O $OVERLAY -B $BEACONING -C "${COMMENT}"
+ExecStart=/usr/local/sbin/igate -I $AX25 -u $CALL -h $SERVER -f /var/log/igate.log -L $LAT -G $LON -A $ALT -S $SYMBOL -O $OVERLAY -B $BEACONING -T /var/lib/ka9q-radio/telem-seq.txt -C "${COMMENT}"
 Restart=always
 RestartSec=5
 TimeoutStopSec=5

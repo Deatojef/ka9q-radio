@@ -22,10 +22,12 @@
 #endif
 #include <signal.h>
 #include <sysexits.h>
+#include <poll.h>
 
 #include "multicast.h"
 #include "ax25.h"
 #include "misc.h"
+
 
 // structures for APRS telemetry data and station particulars
 // ---------------------------------------------------------------------
@@ -66,6 +68,7 @@ char *Longitude;
 char *Altitude;
 char *Comment;
 char *Beaconing = "0";
+char *TelemSeqFilename;
 
 // max packet size for position packets (actually the max size is 256 - 70 = 186, but backing this off by 8 bytes for a little buffer room)
 static int MAX_POSIT = 178;
@@ -95,6 +98,9 @@ char info_string[256];
 // logfile and application name
 FILE *Logfile;
 const char *App_path;
+
+// Telemetry sequence file handle
+FILE *telefile;
 
 // Verbosity level
 int Verbose;
@@ -135,7 +141,9 @@ int telemetrypacket(char *buffer, size_t n, APRS_EQNS *eqns);
 int createinfostring(char *buffer, size_t n, APRS_STATION *station);
 void initstation(APRS_STATION *station);
 void closedown(int x);
-// ---------------------------------------------------------------------
+int readtelemseq(char *filename);
+void writetelemseq(char *filename, int seq);
+// --------------------------------------------------------------------
 
 
 // ---------------------------------------------------------------------
@@ -145,12 +153,15 @@ void closedown(int x);
 // ---------------------------------------------------------------------
 int main(int argc,char *argv[])
 {
+    char timebuffer[1024];
+
     App_path = argv[0];
     // Quickly drop root if we have it
     // The sooner we do this, the fewer options there are for abuse
     if(seteuid(getuid()) != 0)
         fprintf(stderr,"seteuid: %s\n",strerror(errno));
 
+    memset(timebuffer, 0, sizeof(timebuffer));
     setlocale(LC_ALL,getenv("LANG"));
     setlinebuf(stdout);
 
@@ -163,7 +174,7 @@ int main(int argc,char *argv[])
 
     // Parse through command line arguments
     int c;
-    while((c = getopt(argc,argv,"u:p:I:vh:f:L:G:A:S:O:C:V:B:")) != EOF) {
+    while((c = getopt(argc,argv,"u:p:I:vh:f:L:G:A:S:O:C:V:B:T:")) != EOF) {
         switch(c) {
             case 'f':
                 Logfilename = optarg;
@@ -206,11 +217,14 @@ int main(int argc,char *argv[])
             case 'B':
                 Beaconing = optarg;
                 break;
+            case 'T':
+                TelemSeqFilename = optarg;
+                break;
             case 'V':
                 VERSION();
                 exit(EX_OK);
             default:
-                fprintf(stderr,"Usage: %s -u user [-p passcode] [-v] [-I mcast_address][-h host] [-L latitude] [-G longitude] [-A altitude] [-C comment string] [-S symbol char] [-O overlay char] [-B 0|1]\n",argv[0]);
+                fprintf(stderr,"Usage: %s -u user [-p passcode] [-v] [-I mcast_address][-h host] [-L latitude] [-G longitude] [-A altitude] [-C comment string] [-S symbol char] [-O overlay char] [-B 0|1] [-T telemetry sequence filename]\n",argv[0]);
                 exit(EX_USAGE);
         }
     }
@@ -229,16 +243,21 @@ int main(int argc,char *argv[])
 
     if(Logfilename)
         Logfile = fopen(Logfilename,"a");
-    else if(Verbose)
+    else if (Verbose)
         Logfile = stdout;
 
-    if(Logfile) {
+    if (Logfile) {
         setlinebuf(Logfile);
-        fprintf(Logfile,"APRS feeder program by KA9Q\n");
+        format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns());
+        fprintf(Logfile,"%s ################## START:  igate ##############\n", timebuffer);
+    }
+    else {
+        fprintf(stderr, "Unable to write to log file:  %s\n", Logfilename);
+        exit(EX_IOERR);
     }
 
     if(User == NULL) {
-        fprintf(stderr,"Must specify -u User\n");
+        fprintf(stderr,"Must specify a callsign for to use as the user when igating to APRS-IS:  -u User\n");
         exit(EX_USAGE);
     }
 
@@ -285,12 +304,16 @@ int main(int argc,char *argv[])
             memset(info_string, 0, sizeof(info_string));
             if(createinfostring(info_string, sizeof(info_string), &aprs_station) <= 0) {
                 beaconing_enabled = false;
+                fprintf(Logfile, "%s Beaconing to APRS-IS disabled\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
             }
             else {
+                beaconing_enabled = true;
+
                 // print out some info
-                fprintf(Logfile, "%s invoked with latitude=%s, longitude=%s, altitude=%s, symbol=%s, overlay=%s, comment=%s\n", argv[0], Latitude, Longitude, Altitude, Symbol, Overlay, Comment);
-                fprintf(Logfile, "Location of this station: %.4f, %.4f at %d\n", aprs_station.lat, aprs_station.lon, (int) aprs_station.alt);
-                fprintf(Logfile, "Beaconing enabled.\n");
+                format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns());
+                fprintf(Logfile, "%s %s invoked with latitude=%s, longitude=%s, altitude=%s, symbol=%s, overlay=%s, comment=%s\n", timebuffer, argv[0], Latitude, Longitude, Altitude, Symbol, Overlay, Comment);
+                fprintf(Logfile, "%s Location of this station: %.4f, %.4f at %d\n", timebuffer, aprs_station.lat, aprs_station.lon, (int) aprs_station.alt);
+                fprintf(Logfile, "%s Beaconing position packets to %s enabled\n", timebuffer, Host);
             }
         }
     }
@@ -298,6 +321,9 @@ int main(int argc,char *argv[])
         beaconing_enabled = false;
     }
 
+    // get the starting sequence number for telemetry packets sent to the APRS-IS server
+    sequence = readtelemseq(TelemSeqFilename);
+    fprintf(Logfile, "%s Starting telemetry sequence: %d\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), sequence);
 
     // Basically loop until we're supposed stop
     while(!stop_processing) {
@@ -321,12 +347,23 @@ int main(int argc,char *argv[])
         for(int tries=0; tries < 10; tries++) {
             if((ecode = getaddrinfo(Host,Port,&hints,&results)) == 0)
                 break;
-            usleep(500000); // 500 ms
+            fprintf(Logfile, "%s resolver loop sleeping for 500ms.\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()));
+            struct timespec tv;
+            tv.tv_sec = 0;
+            tv.tv_nsec = 5 * 100000000ll;
+            //usleep(500000); // 500 ms
+            nanosleep(&tv, NULL);
         }
 
         if(ecode != 0) {
             fprintf(stderr,"Can't getaddrinfo(%s,%s): %s\n",Host,Port,gai_strerror(ecode));
-            usleep(5000000); // 5 sec
+            fprintf(Logfile, "%s ecode sleeping for 5s.\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()));
+
+            struct timespec tv;
+            tv.tv_sec = 5;
+            tv.tv_nsec = 0;
+            nanosleep(&tv, NULL);
+            //usleep(5000000); // 5 sec
             continue; // Keep trying
         }
 
@@ -342,7 +379,13 @@ int main(int argc,char *argv[])
 
         if(resp == NULL) {
             fprintf(stderr,"Can't connect to server %s:%s\n",Host,Port);
-            sleep(600); // 5 minutes
+            fprintf(Logfile, "%s resp sleeping for 5mins.\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()));
+
+            struct timespec tv;
+            tv.tv_sec = 600;
+            tv.tv_nsec = 0;
+            nanosleep(&tv, NULL);
+            //sleep(600); // 5 minutes
             freeaddrinfo(results);
             resp = results = NULL;
             continue;
@@ -351,8 +394,10 @@ int main(int argc,char *argv[])
         // end:  resolve and connect to aprs-is server
         // --------------------------------------
 
-        if(Logfile)
-            fprintf(Logfile,"Connected to APRS server %s port %s\n",resp->ai_canonname,Port);
+        if(Logfile) {
+            format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns());
+            fprintf(Logfile,"%s Connected to APRS server %s port %s\n", timebuffer, resp->ai_canonname,Port);
+        }
 
         freeaddrinfo(results);
         resp = results = NULL;
@@ -370,7 +415,13 @@ int main(int argc,char *argv[])
             // if there was error, then we close our connection, sleep for 5mins, then restart this outer 'while loop' back at the beginning.
             fclose(network);
             network = NULL;
-            sleep(600); // 5 minutes;
+
+            fprintf(Logfile, "%s login step.  sleeping for 5mins.\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()));
+            struct timespec tv;
+            tv.tv_sec = 600;
+            tv.tv_nsec = 0;
+            nanosleep(&tv, NULL);
+            //sleep(600); // 5 minutes;
             continue;
         }
 
@@ -378,8 +429,27 @@ int main(int argc,char *argv[])
         uint8_t packet[PKTSIZE];
         int size;
 
-        // loop until we no longer are receiving data from the multicast address or we've been signaled to stop processing
-        while((size = recv(Input_fd,packet,sizeof(packet),0)) > 0 && !stop_processing) {
+        // loop until we've been signaled to stop processing
+        while(!stop_processing) {
+
+            struct pollfd pollfd[1];
+            pollfd[0].fd = Input_fd;
+            pollfd[0].events = POLLIN;
+
+            // wait for 50ms for new data to appear on the input socket (i.e. the multicast RTP stream)
+            poll(pollfd, 1, 50);
+
+            // if there was data available then read it it.
+            if(pollfd[0].revents & POLLIN) {
+                // there *should* be data available on the socket, soooo, this shouldn't block.
+                size = recv(Input_fd, packet, sizeof(packet), 0);
+            }
+            else {
+                // no data available on the socket, go back to the start of the loop
+                continue;
+            }
+
+
             struct rtp_header rtp_header;
             uint8_t const *dp = packet;
 
@@ -541,21 +611,26 @@ int main(int argc,char *argv[])
                 // error!
                 fclose(network);
                 network = NULL;
-                goto retry; // Try to reopen the network connection
+                //goto retry; // Try to reopen the network connection
+                            
+                // close the threads
+                pthread_cancel(Read_thread);
+                pthread_join(Read_thread,NULL);
+                pthread_cancel(Beacon_thread);
+                pthread_join(Beacon_thread,NULL);
+
+                // break out of this inner loop
+                break;
             }
-        }
-retry:
-        ;
 
-        // close the threads
-        pthread_cancel(Read_thread);
-        pthread_join(Read_thread,NULL);
-        pthread_cancel(Beacon_thread);
-        pthread_join(Beacon_thread,NULL);
-    }
+        } // inner while loop
+    } // outer while loop
 
-    if (Logfile)
-        fprintf(Logfile, "Done.\n");
+    if (Logfile) 
+        fprintf(Logfile, "%s Done.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
+
+    if (Logfilename && Logfile)
+        fclose(Logfile);
 }
 
 
@@ -566,6 +641,7 @@ void *netreader(void *arg)
 {
     pthread_setname("aprs-read");
 
+    char timebuffer[1024];
     char *line = NULL;
     size_t linecap = 0;
     ssize_t linelen;
@@ -582,8 +658,18 @@ void *netreader(void *arg)
         num++;
 
         // write all incoming data from the APRS-IS server to our log file
-        if(Logfile)
-            fwrite(line,linelen,1,Logfile);
+        if(Logfile) {
+
+            // right trim off any newline/carrage return/spaces from the line we read from the APRS-IS server and place '\0' char at that location.
+            char *end = line + strlen(line) -1;
+            while (end > line && isspace(*end)) {
+                end--;
+            }
+            *(end+1) = '\0';
+
+            fprintf(Logfile, "%s %s: %s\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), Host, line);
+            //fwrite(line,linelen,1,Logfile);
+        }
 
         // if more 2 lines have been received from the APRS-IS server, then we signal the writing thread that its clear to xmit
         if (num > 1 && beacon_locked) {
@@ -616,16 +702,69 @@ void initstation(APRS_STATION *station)
 // Shutdown the application.  Should be called from kill signals.
 void closedown(int x)
 {
+    char timebuffer[1024];
+
     if (Verbose)
-        fprintf(stdout, "\nStopping app...\n");
+        fprintf(Logfile, "%s Stopping app...\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()));
 
     // Set the global to true so that processing loops close down
     stop_processing = true;
 
-    // Sleep for 1 second to allow other threads to close down
-    sleep(1);
 }
 
+
+// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// read the telemetry sequence from the telemetry sequence file
+int readtelemseq(char *filename)
+{
+    FILE *telemfile;
+    int i = 0;
+
+    // Read in the last sequence from the telemetry file
+    if (filename) {
+        telemfile = fopen(filename, "r");
+
+        char *line = NULL;
+        size_t linecap = 0;
+        ssize_t linelen;
+
+        // read in the first line from the telemetry file
+        if (telemfile) {
+            linelen = getline(&line, &linecap, telemfile);
+
+            // if we got something back, then we convert that to an integer and use that value as our starting sequence number.
+            if (linelen > 0) {
+                i = atoi(line);
+
+                // check for rollover or oddness
+                if (i > 999 || i < 0)
+                    i = 0;
+            }
+
+            // close the file (ending sequence number is written to the telemfile upon application end)
+            fclose(telemfile);
+        }
+        FREE(line);
+    }
+
+    return i;
+}
+
+// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// write the telemetry sequence to the telemetry sequence file
+void writetelemseq(char *filename, int seq)
+{
+    FILE *telemfile;
+
+    // write the sequence provide to the file.  This will overwrite the file, btw.
+    if (filename) {
+        telemfile = fopen(filename, "w");
+        fprintf(telemfile, "%d\n", seq);
+        fclose(telemfile);
+    }
+}
 
 // ---------------------------------------------------------------------
 // ---------------------------------------------------------------------
@@ -690,6 +829,9 @@ int telemetrypacket(char *buffer, size_t n, APRS_EQNS *eqns)
     sequence++;
     if (sequence > 999 || sequence < 0)
         sequence = 0;
+
+    // write the last telemetry sequence to the telemetry sequence file
+    writetelemseq(TelemSeqFilename, sequence);
 
     return num;
 
@@ -860,13 +1002,6 @@ void *beaconthread(void *arg)
     // Loop until we can't send data (i.e. something when wrong with talking to the APRS-IS server) or we've been told to stop
     while(ret > 0 && !stop_processing) {
 
-        // if beaconing is enabled, then we are free to send position reports to the APRS-IS server about this station's location, symbol, overlay, comments, etc..
-        if (beaconing_enabled) {
-
-            // create a position report packet string
-            memset(packet_string, 0, sizeof(packet_string));
-            positpacket(packet_string, sizeof(packet_string));
-        }
 
         char timestring[1024];
         char eqns[256];
@@ -876,6 +1011,11 @@ void *beaconthread(void *arg)
         char telem[256];
         APRS_EQNS aprs_eqns;
 
+        // create a position report packet string
+        memset(packet_string, 0, sizeof(packet_string));
+        positpacket(packet_string, sizeof(packet_string));
+
+        // create telemetry packets
         telemetrypacket(telem, sizeof(telem), &aprs_eqns);
         eqnpacket(eqns, sizeof(eqns), &aprs_eqns);
         parampacket(params, sizeof(params));
@@ -921,10 +1061,14 @@ void *beaconthread(void *arg)
 
         // sleep for delta secs
         if (ret > 0) {
-            sleep(delta);
+            struct timespec tv;
+            tv.tv_sec = delta;
+            tv.tv_nsec = 0;
+            nanosleep(&tv, NULL);
         }
 
     }
 
     return NULL;
 }
+
