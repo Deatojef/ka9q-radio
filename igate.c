@@ -1,5 +1,10 @@
+// igate
+//
+// Functionally just an Rx-only igate. 
 // Process AX.25 frames containing APRS data, feed to APRS2 network
-// Copyright 2018-2023, Phil Karn, KA9Q
+//
+// Copyright 2017-2024 Phil Karn, KA9Q & Jeff Deaton, N6BA
+// Major revisions fall 2020, 2023, 2024 (really continuous revisions!)
 
 #define _GNU_SOURCE 1
 #include <assert.h>
