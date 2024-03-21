@@ -1,3 +1,8 @@
+// db.c
+//
+// Functions for logging into, and writing power data to a database table.
+
+
 #include <stdio.h>
 #include <time.h>
 #include <assert.h>
@@ -41,13 +46,12 @@ char hostname[256];
 
 
 
-bool db_init (void)
+bool db_init (char *passfile)
 {
     // hardcoding this for the moment just for testing.
     char connection_string[2048];
     char *host_string = "localhost";
-    char *password_string = "thisisaboguspassword!";
-    char *user_string = "monitor1";
+    char *user_string = "monitor";
     char *dbname_string = "powerdata";
 
     bool okay = true;
@@ -62,14 +66,15 @@ bool db_init (void)
     //    fprintf(stdout, "Using hostname:  %s\n", hostname);
     //}
 
+    //pgpass="monitor1:5432:powerdata:monitor1:thisisaboguspassword!"
     memset(connection_string, 0, sizeof(connection_string));
-    snprintf(connection_string, sizeof(connection_string), "user=%s sslmode=require host=%s password=%s dbname=%s ", user_string, host_string, password_string, dbname_string);
+    snprintf(connection_string, sizeof(connection_string), "user=%s sslmode=require host=%s dbname=%s passfile=%s", user_string, host_string, dbname_string, passfile);
 
     // connect to the database...
     db_connection = PQconnectdb(connection_string);
 
     if (PQstatus(db_connection) != CONNECTION_OK) {
-        fprintf (stderr, "Unable to connect to database, %s, %s.\n", dbname_string, PQerrorMessage(db_connection));
+        fprintf (stderr, "Unable to connect to database, connection_string=%s, %s.\n", connection_string, PQerrorMessage(db_connection));
         PQfinish(db_connection);
         okay = false;
     } 
@@ -84,7 +89,7 @@ bool db_init (void)
 
 
 // timestamp, ssrc, lna_gain, mixer_gain, if_gain, input_power_dbfs, frontend_gain_db, baseband_power_db, snr_dB
-bool db_write(long long timestamp, int gps_mode, double gps_lat, double gps_lon, int ssrc, int lna_gain, int mixer_gain, int if_gain, int input_power_dbfs, int frontend_gain_db, int baseband_power_db, int snr_db)
+bool db_write(long long timestamp, int gps_mode, double gps_lat, double gps_lon, int ssrc, int lna_gain, int mixer_gain, int if_gain, double input_power_dbfs, double frontend_gain_db, double baseband_power_db, double snr_db)
 {
     // DB objects
     PGresult *res;
@@ -112,7 +117,7 @@ bool db_write(long long timestamp, int gps_mode, double gps_lat, double gps_lon,
     // construct the time string
     format_gpstime(timestring, sizeof(timestring), timestamp);
 
-    snprintf(insert_sql, sizeof(insert_sql), "insert into powerdata (time, host, gps_mode, gps_lat, gps_lon, frequency, lna_gain, mixer_gain, if_gain, input_power_dbfs, frontend_gain_db, baseband_power_db, snr_db) values ('%s', '%s', %d, %f, %f, %d, %d, %d, %d, %d, %d, %d, %d);", 
+    snprintf(insert_sql, sizeof(insert_sql), "insert into powerdata (time, host, gps_mode, gps_lat, gps_lon, frequency, lna_gain, mixer_gain, if_gain, input_power_dbfs, frontend_gain_db, baseband_power_db, snr_db) values ('%s', '%s', %d, %f, %f, %d, %d, %d, %d, %.2f, %.2f, %.2f, %.2f);", 
             timestring,
             hostname,
             gps_mode,

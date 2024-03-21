@@ -1,9 +1,9 @@
-// Interactive program to send commands and display internal state of 'radiod'
-// Why are user interfaces always the biggest, ugliest and buggiest part of any program?
-// Written as one big polling loop because ncurses is **not** thread safe
-
-// Copyright 2017-2023 Phil Karn, KA9Q
-// Major revisions fall 2020, 2023 (really continuous revisions!)
+// powerlogger
+//
+// This will log into the local database (postgresql), and save received power data as rows in that database.
+//
+// Copyright 2017-2024 Phil Karn, KA9Q & Jeff Deaton, N6BA
+// Major revisions fall 2020, 2023, 2024 (really continuous revisions!)
 
 #define _GNU_SOURCE 1
 #include <assert.h>
@@ -45,20 +45,25 @@
 // Globals
 static int const DEFAULT_IP_TOS = 48;
 static int const DEFAULT_MCAST_TTL = 1; // LAN only, no routers
-//static float Refresh_rate = 0.25f;
-static float Refresh_rate = .25f;
 static struct sockaddr_storage Metadata_dest_address;      // Dest of metadata (typically multicast)
-
 int Mcast_ttl = DEFAULT_MCAST_TTL;
 int IP_tos = DEFAULT_IP_TOS;
-int Ctl_fd,Status_fd;
-const char *App_path;
+int Ctl_fd;
+int Status_fd;
+
+// defaults for command line arguments
 int Verbose;
+const char *App_path;
+static float Refresh_rate = .25;
 float SNR_threshold = 0.0;
 bool stop_processing = false;
+char *GPSDHost = "localhost";
+char *Status_hostname = "2m.local";
+char *pgpass_file = "/var/lib/ka9q-radio/.pgpass";
+char *Logfilename = "/var/log/powerlogger.log";
+FILE *Logfile;
 
-
-// This is the list of ssrc's that we're interested and how many of them there are
+// structure to hold the SSRC data
 typedef struct ssrcitem {
     int ssrc;
     int64_t lastpoll;
@@ -91,15 +96,18 @@ void closedown(int x);
 void publishdata(ssrcitem_t *ssrc);
 ssrcitem_t *parse_int_string(const char *str, int *num_elements);
 static int decode_radio_status(ssrcitem_t *ssrcitem,uint8_t const *buffer,int length);
+void rmch(char *source, char c, char *dest, size_t dest_size);
 
 
 // Main routine that loops until killed.
 int main(int argc,char *argv[])
 {
+    char timebuffer[1024];
+
     App_path = argv[0];
     {
         int c;
-        while((c = getopt(argc,argv,"vVs:r:n:y:")) != -1) {
+        while((c = getopt(argc,argv,"vVI:s:r:n:y:G:L:p:")) != -1) {
             switch(c) {
                 case 'V':
                     VERSION();
@@ -116,11 +124,30 @@ int main(int argc,char *argv[])
                 case 'n':
                     SNR_threshold = strtod(optarg, NULL);
                     break;
+                case 'G':
+                    GPSDHost = optarg;
+                    break;
+                case 'L':
+                    Logfilename = optarg;
+                    break;
+                case 'I':
+                    Status_hostname = optarg;
+                    break;
+                case 'p':
+                    pgpass_file = optarg;
+                    break;
                 default:
                     fprintf(stdout,"Unknown option %c\n",c);
                     break;
             }
         }
+    }
+
+    // Check that proper arguments were used with starting up
+    if (ssrclist == NULL || num_ssrc == 0 || !Status_hostname) {
+        fprintf(stderr,"Usage: %s -s <ssrc list> -I <mcast_group> [-r <refresh rate in secs>] [-v] [-G GPSD hostname] [-n SNR threshold]\n",App_path);
+        fprintf(stderr,"<ssrclist> is a list of space seperated frequences (ex. \"144m710 145m310\", mcast_group is DNS name or IP address of control multicast group, \n");
+        exit(EX_USAGE);
     }
 
     // capture any sort of kill/close conditions.  Mostly so we can cleanly exit, disconnect from the database, etc..
@@ -130,25 +157,42 @@ int main(int argc,char *argv[])
     signal(SIGQUIT, closedown);
     signal(SIGTERM, closedown);
 
-
-    // Check that proper arguments were used with starting up
-    if(argc <= optind) {
-        fprintf(stderr,"Usage: %s -s <ssrc list> mcast_group [-r <refresh rate in secs>] [-v]\n",App_path);
-        fprintf(stderr,"<ssrclist> is a list of comma seperated positive decimal numbers, mcast_group is DNS name or IP address of control multicast group\n");
-        exit(EX_USAGE);
+    // where are we logging output too?
+    if (Logfilename) {
+        Logfile = fopen(Logfilename, "a");
     }
-    if (ssrclist == NULL || num_ssrc == 0) {
-        fprintf(stderr,"Missing <ssrc>\n");
-        fprintf(stderr,"Usage: %s -s <ssrc> mcast_group [-r <refresh rate in secs>] [-v]\n",App_path);
-        fprintf(stderr,"<ssrclist> is a list of comma seperated positive decimal numbers, mcast_group is DNS name or IP address of control multicast group\n");
-        exit(EX_USAGE);
+    else if (Verbose) {
+        Logfile = stdout;
     }
 
+    if (Logfile) {
+        setlinebuf(Logfile);
+        format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns());
+        fprintf(Logfile, "%s ################## START:  powerlogger ##############\n", timebuffer);
+
+
+        // print out the list of frequencies we're listening too
+        fprintf(Logfile, "%s Frequency List: ", timebuffer);
+        int i;
+        for (i = 0; i < num_ssrc; i++) {
+            fprintf(Logfile, "%.3fMHz ", (float) ssrclist[i].ssrc / 1000.0);
+        }
+        if (i > 0)
+            fprintf(Logfile, "\n");
+
+        // other command line parameters
+        fprintf(Logfile, "%s Multicast addr: %s, GPSD Host: %s, Refresh period (s): %.4ff, SNR Threshold: %.4f\n", timebuffer, Status_hostname, GPSDHost, Refresh_rate, SNR_threshold);
+
+    }
+    else {
+        fprintf(stderr, "Unable to write to log file:  %s\n", Logfilename);
+        exit(EX_IOERR);
+    }
 
     // try and log into the database.  If unable to connect to the DB, then we can't proceed.
-    if (db_init()) {
+    if (db_init(pgpass_file)) {
         if (Verbose)
-            fprintf(stdout, "database connection successful\n");
+            fprintf(Logfile, "%s Database connection successful\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
     } 
     else {
         fprintf(stderr, "Unable to connect to database\n");
@@ -157,17 +201,17 @@ int main(int argc,char *argv[])
 
     // This is the status RTP address (ex. 2m.local, 70cm.local)
     char iface[1024]; // Multicast interface
-    resolve_mcast(argv[optind],&Metadata_dest_address,DEFAULT_STAT_PORT,iface,sizeof(iface));
-    Status_fd = listen_mcast(&Metadata_dest_address,iface);
+    resolve_mcast(Status_hostname, &Metadata_dest_address, DEFAULT_STAT_PORT, iface, sizeof(iface));
+    Status_fd = listen_mcast(&Metadata_dest_address, iface);
     
     // If unable to connect to the status multicast address then exit
     if(Status_fd == -1) {
-        fprintf(stderr,"Can't listen to mcast status %s\n",argv[optind]);
+        fprintf(stderr,"Can't listen to mcast status %s\n", Status_hostname);
         exit(EX_IOERR);
     }
 
     // this is the same status RTP address, except that we need to use this file descriptor to send a "poll" command to multicast group.
-    Ctl_fd = connect_mcast(&Metadata_dest_address,iface,Mcast_ttl,IP_tos);
+    Ctl_fd = connect_mcast(&Metadata_dest_address, iface, Mcast_ttl, IP_tos);
     if(Ctl_fd < 0) {
         fprintf(stderr,"connect to mcast control failed\n");
         exit(EX_IOERR);
@@ -242,7 +286,7 @@ int main(int argc,char *argv[])
                 struct sockaddr_storage source_address;
                 socklen_t ssize = sizeof(source_address);
                 length = recvfrom(Status_fd,buffer,sizeof(buffer),0,(struct sockaddr *)&source_address,&ssize); // should not block
-                                                                                                                //
+                                                                                                                
                 // Ignore our own command packets and responses to other SSIDs
                 if(length >= 0 && (enum pkt_type)buffer[0] == STATUS) {
                     ssrc = for_us(buffer+1, length-1);
@@ -273,11 +317,11 @@ int main(int argc,char *argv[])
     pthread_cancel(gps_thread);
     pthread_join(gps_thread,NULL);
 
-    fprintf(stdout, "Done.\n");
+    fprintf(Logfile, "%s Done.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
     exit(EXIT_SUCCESS);
 }
 
-// parse a string creating an array of integers
+// parse a string creating an array of integers (ultimate the ssrc's we want to monitor)
 ssrcitem_t *parse_int_string(const char *str, int *num_elements)
 {
     int capacity = 8;  // Initial capacity for the array
@@ -291,30 +335,64 @@ ssrcitem_t *parse_int_string(const char *str, int *num_elements)
         return NULL; // Memory allocation failed
     }
 
-    token = strtok(dup, ",");
+    // get the first string from the space delimited list
+    token = strtok(dup, " ");
+
+    // loop until we run out of tokens (i.e. space delimited string)
     while (token != NULL) {
         if (*num_elements == capacity) {
 
             // Reallocate array if it reaches capacity
             capacity *= 2;
-            arr = realloc(arr, capacity * sizeof(int));
+            arr = realloc(arr, capacity * sizeof(ssrcitem_t));
             if (arr == NULL) {
                 free(dup);
                 return NULL; // Memory allocation failed
             }
         }
+
+        // parse the token (ex. 144m390, 446m310, etc.).  aka just remove the 'm'.  
+        int len = strlen(token);
+        char ssrc[len];
+
+        // remove the 'm' from the token and save the result into the ssrc string
+        memset(ssrc, 0, sizeof(ssrc));
+        rmch(token, 'm', ssrc, sizeof(ssrc));
+
+        // update our array of structs
         arr[*num_elements].Frontend.frequency = NAN;
         arr[*num_elements].Frontend.min_IF = NAN;
         arr[*num_elements].Frontend.max_IF = NAN;
         init_demod(&(arr[*num_elements].Channel));
-        arr[*num_elements].ssrc = atoi(token);
+        arr[*num_elements].ssrc = atoi(ssrc);
         arr[*num_elements].lastpoll = 0;
         (*num_elements)++;
-        token = strtok(NULL, ",");
+
+        // get the next token from the list
+        token = strtok(NULL, " ");
     }
 
     free(dup);
     return arr;
+}
+
+//  remove a specific character from a string, placing the result in the 'dest' string.
+void rmch(char *source, char c, char *dest, size_t dest_size)
+{
+    int i;
+
+    // loop through each char in the source
+    for (i = 0; *source != 0 && i < dest_size; source++, i++) {
+        if (*source == c)
+            // we found the character, 'c'.  We skip anything below and just start again at the top of the loop....
+            continue;
+
+        // otherwise, this is a normal character so we write it to the position pointed to by source
+        *dest = *source;
+
+        // increment our destination pointer
+        dest++;
+    }
 }
 
 // Initialize a new, unused channel instance where fields start non-zero
@@ -691,7 +769,7 @@ void publishdata(ssrcitem_t *ssrc)
             ns2ts(&ts, Frontend->timestamp);
             gmtime_r((const time_t *) &(ts.tv_sec), &t);
             memset(buffer, 0, sizeof(buffer));
-            fprintf(stdout, "%s, %d, %.6f, %.6f, %d, %02d, %02d, %02d, %.1f, %.1f, %.1f, %.1f\n",
+            fprintf(stdout, "%s, %d, %.6f, %.6f, %d, %02d, %02d, %02d, %.2f, %.2f, %.2f, %.2f\n",
                     format_gpstime(buffer, sizeof(buffer), Frontend->timestamp),
                     local_gps_mode,
                     local_gps_mode < 3 ? 0 : local_gps_lat,
@@ -716,7 +794,7 @@ void closedown(int x)
     if (Verbose)
         fprintf(stdout, "\nStopping app...\n");
     stop_processing = true;
-    sleep(1);
+    //sleep(1);
     if (Verbose)
         fprintf(stdout, "Disconnected from database.\n");
     db_term();
@@ -728,6 +806,8 @@ void *gpsthread(void *arg)
 {
     pthread_setname("gps-thread");
 
+    char timebuffer[1024];
+
     // we'll store GPS data in this structure.
     struct gps_data_t gps_data;
 
@@ -738,7 +818,7 @@ void *gpsthread(void *arg)
     while (!stop_processing) {
 
         if (0 != gps_open("localhost", "2947", &gps_data)) {
-            fprintf(stderr, "Unable to connect to GPSD.  trycount=%d.\n", trycount);
+            fprintf(Logfile, "%s Unable to connect to GPSD.  trycount=%d\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), trycount);
 
             // sleep for a few microseconds.  Ramping up the sleep time as the trycount gets large (i.e. we've lost connectivity all together...no sense in just continually retrying).
             float usecs = 10 * exp(trycount);
@@ -754,7 +834,7 @@ void *gpsthread(void *arg)
         // Loop continuously reading from GPSD
         while (gps_waiting(&gps_data, 5000000) && !stop_processing) {
             if (-1 == gps_read(&gps_data, NULL, 0)) {
-                fprintf(stderr, "Unable to read from GPSD.\n");
+                fprintf(Logfile, "%s Unable to read from GPSD.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
                 break;
             }
 
@@ -783,7 +863,7 @@ void *gpsthread(void *arg)
                 
                 // reset the trycount since we've just read data from the GPS
                 if (trycount > 0) {
-                    fprintf(stderr, "Reconnected to GPSD. GPS Mode: %d\n", gps_data.fix.mode);
+                    fprintf(Logfile, "%s Reconnected to GPSD.  GPS mode: %d.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), gps_data.fix.mode);
                     trycount = 0;
                 }
 
@@ -797,7 +877,7 @@ void *gpsthread(void *arg)
     // When you are done...
     (void)gps_stream(&gps_data, WATCH_DISABLE, NULL);
     (void)gps_close(&gps_data);
-    fprintf(stdout, "GPS thread ended.\n");
+    fprintf(Logfile, "%s GPSD thread ended.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
 
     return NULL;
 }
