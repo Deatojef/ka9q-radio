@@ -366,57 +366,54 @@ int main(int argc,char *argv[]){
   else
     Use_browser = true;
 
-  while(Ssrc == 0){
-    Ssrc = arc4random();
-    fprintf(stderr,"-s missing, generating random ssrc: %'u\n",Ssrc);
-  }
   if(Use_browser){
     // Use avahi browser to find a radiod instance to control
-    pthread_t avahi_browser_thread;
-    pthread_create(&avahi_browser_thread,NULL,avahi_browser,NULL);
     fprintf(stdout,"Scanning for radiod instances...\n");
-    sleep(5); // Wait for the entries to appear
-    pthread_mutex_lock(&Avahi_browser_mutex);
-    if(Avahi_database == NULL){
-      // Nothing out there, quit
-      fprintf(stderr,"No radiod target specified, and nothing running\n");
-      exit(0);
-    }
+    struct service_tab table[1000];
 
-    int radiod_count = 0;
-    for(struct avahi_db *db = Avahi_database; db != NULL; db = db->next,radiod_count++)
-      ;
+    int radiod_count = avahi_browse(table,1000,"_ka9q-ctl._udp"); // Returns list in global when cache is emptied
+    if(radiod_count == 0){
+      fprintf(stdout,"No radiod targets, or Avahi not running, ; specify control channel manually\n");
+      exit(EX_UNAVAILABLE);
+    }
     if(radiod_count == 1){
       // Only one, use it
-      target = strdup(Avahi_database->host_name);      // Redo this to avoid the call to resolve_mcast
+      target = table[0].dns_name;      // Redo this to avoid the call to resolve_mcast
     } else {
-      int i = 0;
-      for(struct avahi_db *db = Avahi_database; db != NULL; db = db->next,i++)
-	fprintf(stdout,"%d - %s\n",i,db->host_name);
+      for(int i=0; i < radiod_count; i++)
+	fprintf(stdout,"%d: %s (%s)\n",i,table[i].name,table[i].dns_name);
       fprintf(stdout,"Select index: ");
       fflush(stdout);
       char line[1024];
-      fgets(line,sizeof(line),stdin);
-      char *endptr = NULL;
-      int n = strtol(line,&endptr,0);
-      struct avahi_db *db;
-      for(i=0,db = Avahi_database; db != NULL && i != n; db = db->next,i++)      
-	;
-      target = strdup(db->host_name);
+      if(fgets(line,sizeof(line),stdin) == NULL || feof(stdin) || ferror(stdin)){
+	fprintf(stdout,"EOF on input\n");
+	exit(EX_USAGE);
+      }
+      int n = strtol(line,NULL,0);
+      if(n < 0 || n >= radiod_count){
+	fprintf(stdout,"Index %d out of range, try again\n",n);
+	exit(EX_USAGE);
+      }
+      int port = strtol(table[n].port,NULL,0);
+      // 'avahi-browse' returns the IP address, port and interface so we don't have to resolve them
+      // So this call to resolve_mcast() could be a direct conversion using a sockaddr utility
+      resolve_mcast(table[n].address,&Metadata_dest_address,port,NULL,0);
+      Status_fd = listen_mcast(&Metadata_dest_address,table[n].interface);
+      Ctl_fd = connect_mcast(&Metadata_dest_address,table[n].interface,Mcast_ttl,IP_tos);
     }
-    pthread_mutex_unlock(&Avahi_browser_mutex);
-    pthread_cancel(avahi_browser_thread); // will it be a zombie now?
+  } else {
+    // Use resolv_mcast to resolve a manually entered domain name, using default port and parsing possible interface
+    char iface[1024]; // Multicast interface
+    resolve_mcast(target,&Metadata_dest_address,DEFAULT_STAT_PORT,iface,sizeof(iface));
+    Status_fd = listen_mcast(&Metadata_dest_address,iface);
+    Ctl_fd = connect_mcast(&Metadata_dest_address,iface,Mcast_ttl,IP_tos);
   }
-  char iface[1024]; // Multicast interface
-  resolve_mcast(target,&Metadata_dest_address,DEFAULT_STAT_PORT,iface,sizeof(iface));
-  Status_fd = listen_mcast(&Metadata_dest_address,iface);
-  if(Status_fd == -1){
-    fprintf(stderr,"Can't listen to mcast status %s\n",argv[optind]);
+  if(Status_fd < 0){
+    fprintf(stderr,"Can't listen to mcast status channel: %s\n",strerror(errno));
     exit(EX_IOERR);
   }
-  Ctl_fd = connect_mcast(&Metadata_dest_address,iface,Mcast_ttl,IP_tos);
   if(Ctl_fd < 0){
-    fprintf(stderr,"connect to mcast control failed\n");
+    fprintf(stderr,"Can't send to mcast control channel: %s\n",strerror(errno));
     exit(EX_IOERR);
   }
   char presetsfile_path[PATH_MAX];
@@ -430,7 +427,60 @@ int main(int argc,char *argv[]){
     exit(EX_NOINPUT);
   }
   atexit(display_cleanup);
-
+  while(Ssrc == 0){
+    // None specified, get a list, let user choose
+    struct channel *const channel = &Channel;
+    init_demod(channel);
+    send_poll(Ctl_fd,0xffffffff);
+    // Read responses
+    fprintf(stdout,"Channel list:\n");
+    fprintf(stdout,"%13s %6s %13s %5s\n","SSRC","preset","freq, Hz","SNR");
+    while(true){
+      int const npoll = 1;
+      struct pollfd pollfd[npoll];
+      pollfd[0].fd = Status_fd;
+      pollfd[0].events = POLLIN;
+      
+      int n = poll(pollfd,npoll,100);
+      if(n <= 0)
+	break; // Timeout or failure
+      
+      if(pollfd[0].revents & POLLIN){
+	struct sockaddr_storage source_address;
+	socklen_t ssize = sizeof(source_address);
+	uint8_t buffer[PKTSIZE];	
+	int length;
+	length = recvfrom(Status_fd,buffer,sizeof(buffer),0,(struct sockaddr *)&source_address,&ssize); // should not block
+	// Ignore our own command packets
+	if(length >= 2 && (enum pkt_type)buffer[0] == STATUS){
+	  // Process only if it's a response to our SSRC
+	  memcpy(&Metadata_source_address,&source_address,sizeof(Metadata_source_address));
+	  decode_radio_status(channel,buffer+1,length-1);
+	  float snr;
+	  {
+	    float const noise_bandwidth = fabsf(channel->filter.max_IF - channel->filter.min_IF);
+	    float sig_power = channel->sig.bb_power - noise_bandwidth * channel->sig.n0;
+	    float sn0 = sig_power/channel->sig.n0;
+	    snr = power2dB(sn0/noise_bandwidth);
+	  }
+	  fprintf(stdout,"%'13u %6s %'13.f %5.1f\n",channel->output.rtp.ssrc,channel->preset,channel->tune.freq,snr);
+	}
+      }
+    }
+    fprintf(stdout,"Choose SSRC or create new: ");
+    fflush(stdout);
+    char line[128];
+    if(fgets(line,sizeof(line),stdin) == NULL || feof(stdin) || ferror(stdin)){
+      fprintf(stdout,"EOF on input, exiting\n");
+      exit(EX_USAGE);
+    }
+    int n = strtol(line,NULL,0);
+    if(n <= 0){
+      fprintf(stdout,"Try again\n");
+    } else {
+      Ssrc = n;
+    }
+  }
   // Set up display subwindows
   Tty = fopen("/dev/tty","r+");
   Term = newterm(NULL,Tty,Tty);
