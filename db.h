@@ -11,7 +11,7 @@
 
 
 // db_init opens a DB connection to postgresql 
-bool db_init(char *pgpassfile);
+bool db_init (char *host, char *dbname, char *user, char *table, char *passfile);
 
 //  db_write will write a packet to the backend database
 bool db_write(long long timestamp, int gps_mode, double gps_lat, double gps_lon, int ssrc, int lna_gain, int mixer_gain, int if_gain, double input_power_dbfs, double frontend_gain_db, double baseband_power_db, double snr_db);

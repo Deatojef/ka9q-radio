@@ -30,6 +30,7 @@
 
 static PGconn *db_connection;
 char hostname[256];
+char tablename[256];
 
 
 /*------------------------------------------------------------------
@@ -46,13 +47,13 @@ char hostname[256];
 
 
 
-bool db_init (char *passfile)
+bool db_init (char *host, char *dbname, char *user, char *table, char *passfile)
 {
     // hardcoding this for the moment just for testing.
     char connection_string[2048];
-    char *host_string = "localhost";
-    char *user_string = "monitor";
-    char *dbname_string = "powerdata";
+    char *host_string = host;
+    char *user_string = user;
+    char *dbname_string = dbname;
 
     bool okay = true;
 
@@ -62,9 +63,10 @@ bool db_init (char *passfile)
         fprintf(stderr, "Unable to get system's hostname\n");
         strncpy(hostname, "localhost", sizeof(hostname));
     }
-    //else {
-    //    fprintf(stdout, "Using hostname:  %s\n", hostname);
-    //}
+
+    // set the table name
+    memset(tablename, 0, sizeof(tablename));
+    strncpy(tablename, table, sizeof(tablename) - 1);
 
     //pgpass="monitor1:5432:powerdata:monitor1:thisisaboguspassword!"
     memset(connection_string, 0, sizeof(connection_string));
@@ -117,7 +119,8 @@ bool db_write(long long timestamp, int gps_mode, double gps_lat, double gps_lon,
     // construct the time string
     format_gpstime(timestring, sizeof(timestring), timestamp);
 
-    snprintf(insert_sql, sizeof(insert_sql), "insert into powerdata (time, host, gps_mode, gps_lat, gps_lon, frequency, lna_gain, mixer_gain, if_gain, input_power_dbfs, frontend_gain_db, baseband_power_db, snr_db) values ('%s', '%s', %d, %f, %f, %d, %d, %d, %d, %.2f, %.2f, %.2f, %.2f);", 
+    snprintf(insert_sql, sizeof(insert_sql), "insert into %s (time, host, gps_mode, gps_lat, gps_lon, frequency, lna_gain, mixer_gain, if_gain, input_power_dbfs, frontend_gain_db, baseband_power_db, snr_db) values ('%s', '%s', %d, %f, %f, %d, %d, %d, %d, %.2f, %.2f, %.2f, %.2f);", 
+            tablename,
             timestring,
             hostname,
             gps_mode,

@@ -61,7 +61,12 @@ char *GPSDHost = "localhost";
 char *Status_hostname = "2m.local";
 char *pgpass_file = "/var/lib/ka9q-radio/.pgpass";
 char *Logfilename = "/var/log/powerlogger.log";
+char *dbname = "powerdata";
+char *dbtable = "powerdata";
+char *dbuser = "monitor";
+char *dbhost = "localhost";
 FILE *Logfile;
+
 
 // structure to hold the SSRC data
 typedef struct ssrcitem {
@@ -107,7 +112,7 @@ int main(int argc,char *argv[])
     App_path = argv[0];
     {
         int c;
-        while((c = getopt(argc,argv,"vVI:s:r:n:y:G:L:p:")) != -1) {
+        while((c = getopt(argc,argv,"vVI:s:r:n:y:G:L:p:D:U:T:H:")) != -1) {
             switch(c) {
                 case 'V':
                     VERSION();
@@ -135,6 +140,18 @@ int main(int argc,char *argv[])
                     break;
                 case 'p':
                     pgpass_file = optarg;
+                    break;
+                case 'D':
+                    dbname = optarg;
+                    break;
+                case 'U':
+                    dbuser = optarg;
+                    break;
+                case 'T':
+                    dbtable = optarg;
+                    break;
+                case 'H':
+                    dbhost = optarg;
                     break;
                 default:
                     fprintf(stdout,"Unknown option %c\n",c);
@@ -190,7 +207,7 @@ int main(int argc,char *argv[])
     }
 
     // try and log into the database.  If unable to connect to the DB, then we can't proceed.
-    if (db_init(pgpass_file)) {
+    if (db_init(dbhost, dbname, dbuser, dbtable, pgpass_file)) {
         if (Verbose)
             fprintf(Logfile, "%s Database connection successful\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
     } 
