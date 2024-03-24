@@ -235,17 +235,6 @@ int main(int argc,char *argv[])
     }
 
 
-    // Set up multicast input
-    {
-        struct sockaddr_storage sock;
-        resolve_mcast(Mcast_address_text,&sock,DEFAULT_RTP_PORT,NULL,0);
-        Input_fd = listen_mcast(&sock,NULL);
-    }
-    if(Input_fd == -1) {
-        fprintf(stderr,"Can't set up multicast input from %s\n",Mcast_address_text);
-        exit(EX_IOERR);
-    }
-
     if(Logfilename)
         Logfile = fopen(Logfilename,"a");
     else if (Verbose)
@@ -296,6 +285,9 @@ int main(int argc,char *argv[])
     if (Beaconing) {
         int b = atoi(Beaconing);
 
+        if (b <= 0)
+            fprintf(Logfile, "%s Not configured to beacon station position to APRS-IS.  However, will send telemetry data.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
+
         if (b > 0 && Latitude && Longitude && Altitude && Symbol && Overlay && Comment) {
 
             // populate this station's details
@@ -324,6 +316,7 @@ int main(int argc,char *argv[])
     }
     else {
         beaconing_enabled = false;
+        fprintf(Logfile, "%s Not configured to beacon station position to APRS-IS.  However, will send telemetry data.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
     }
 
     // get the starting sequence number for telemetry packets sent to the APRS-IS server
@@ -384,10 +377,10 @@ int main(int argc,char *argv[])
 
         if(resp == NULL) {
             fprintf(stderr,"Can't connect to server %s:%s\n",Host,Port);
-            fprintf(Logfile, "%s resp sleeping for 5mins.\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()));
+            fprintf(Logfile, "%s Can't connect to server %s:%s, sleeping for 2mins.\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()), Host, Port);
 
             struct timespec tv;
-            tv.tv_sec = 600;
+            tv.tv_sec = 60*2;
             tv.tv_nsec = 0;
             nanosleep(&tv, NULL);
             //sleep(600); // 5 minutes
@@ -430,6 +423,22 @@ int main(int argc,char *argv[])
             continue;
         }
 
+
+        // close this file descriptor just in case it was open from a prior loop iteration
+        //if (Input_fd != -1 && Input_fd != NULL) {
+        //    fclose(Input_fd);
+        //}
+
+        // Set up multicast input
+        {
+            struct sockaddr_storage sock;
+            resolve_mcast(Mcast_address_text,&sock,DEFAULT_RTP_PORT,NULL,0);
+            Input_fd = listen_mcast(&sock,NULL);
+        }
+        if (Input_fd == -1) {
+            fprintf(stderr,"Can't set up multicast input from %s\n",Mcast_address_text);
+            exit(EX_IOERR);
+        }
 
         uint8_t packet[PKTSIZE];
         int size;
@@ -613,6 +622,10 @@ int main(int argc,char *argv[])
             pthread_mutex_unlock(&tcp_lock);
 
             if (ret <= 0) {
+
+                fprintf(stderr,"Error communicating to server, %s:%s\n",Host,Port);
+                fprintf(Logfile, "%s Exiting, error communicating to server, %s:%s.\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()), Host, Port);
+
                 // error!
                 fclose(network);
                 network = NULL;
@@ -710,7 +723,7 @@ void closedown(int x)
     char timebuffer[1024];
 
     if (Verbose)
-        fprintf(Logfile, "%s Stopping app...\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()));
+        fprintf(Logfile, "%s Stopping app.  Received signal: %d\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()), x);
 
     // Set the global to true so that processing loops close down
     stop_processing = true;
