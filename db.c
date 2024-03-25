@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <math.h>
 
 // This is for postgresql
 #ifdef __APPLE__
@@ -90,6 +91,22 @@ bool db_init (char *host, char *dbname, char *user, char *table, char *passfile)
 }
 
 
+double rangecheck(double x) 
+{
+    int nan = isnan(x);
+    if (nan) 
+        return 0.0;
+
+    int inf = isinf(x);
+    if (inf == -1)
+        return -100;
+    if (inf == 1)
+        return 100;
+
+    return x;
+}
+
+
 // timestamp, ssrc, lna_gain, mixer_gain, if_gain, input_power_dbfs, frontend_gain_db, baseband_power_db, snr_dB
 bool db_write(long long timestamp, int gps_mode, double gps_lat, double gps_lon, int ssrc, int lna_gain, int mixer_gain, int if_gain, double input_power_dbfs, double frontend_gain_db, double baseband_power_db, double snr_db)
 {
@@ -130,10 +147,10 @@ bool db_write(long long timestamp, int gps_mode, double gps_lat, double gps_lon,
             lna_gain, 
             mixer_gain,
             if_gain,
-            input_power_dbfs,
-            frontend_gain_db,
-            baseband_power_db,
-            snr_db
+            rangecheck(input_power_dbfs),
+            rangecheck(frontend_gain_db),
+            rangecheck(baseband_power_db),
+            rangecheck(snr_db)
     );
 
     // Execute the SQL statement 
