@@ -20,7 +20,7 @@ ExecStartPre=/bin/chown igate /var/lib/ka9q-radio/telem-seq.txt
 
 # set CALL and SERVER and others in /etc/radio/igate.conf
 EnvironmentFile=/etc/radio/igate.conf
-ExecStart=/usr/local/sbin/igate -I $AX25 -u $CALL -h $SERVER -f /var/log/igate.log -L $LAT -G $LON -A $ALT -S $SYMBOL -O $OVERLAY -B $BEACONING -T /var/lib/ka9q-radio/telem-seq.txt -C "${COMMENT}"
+ExecStart=/usr/local/sbin/igate -I $AX25 -u $CALL -h $SERVER -f /var/log/igate.log $LAT $LON $ALT -S "${SYMBOL}" $OVERLAY -B $BEACONING -T /var/lib/ka9q-radio/telem-seq.txt -C "${COMMENT}" $GPSDHOST -M $MOBILE
 Restart=always
 RestartSec=5
 TimeoutStopSec=5

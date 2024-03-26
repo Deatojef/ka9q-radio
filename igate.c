@@ -28,6 +28,7 @@
 #include <signal.h>
 #include <sysexits.h>
 #include <poll.h>
+#include <gps.h>
 
 #include "multicast.h"
 #include "ax25.h"
@@ -49,9 +50,11 @@ typedef struct {
 } APRS_EQNS;
 
 typedef struct {
-    float lat;
-    float lon;
-    float alt;
+    double lat;
+    double lon;
+    double alt;
+    double course;
+    double speed;
     char symbol[3];  // character representing the symbol
     char overlay[3]; // character representing the char to be overlaid on top of the symbol
     char comment[186]; // max APRS information field length is 256 bytes. That minus normal position packet length (ex. 70 bytes), leaves 186 bytes for "everything else" like the station comment.
@@ -72,8 +75,10 @@ char *Latitude;
 char *Longitude;
 char *Altitude;
 char *Comment;
+char *Mobile = "0";
 char *Beaconing = "0";
 char *TelemSeqFilename;
+char *GPSDHost = NULL;
 
 // max packet size for position packets (actually the max size is 256 - 70 = 186, but backing this off by 8 bytes for a little buffer room)
 static int MAX_POSIT = 178;
@@ -96,9 +101,12 @@ char *tocall = "APZKR1";
 // By default beaconing to APRS-IS is not enabled.
 bool beaconing_enabled = false;
 
+// By default, not using GPSD for location information
+bool gpsd_enabled = false;
+int gpsmode;
+
 // station information
 APRS_STATION aprs_station;
-char info_string[256];
 
 // logfile and application name
 FILE *Logfile;
@@ -117,6 +125,8 @@ int Network_fd = -1;
 // The global variable that processing loops check.  If this is set to "true", then processing loops should end.
 bool stop_processing = false;
 
+// is this a statis or mobile station.  Static by default
+bool ismobile = false;
 // ---------------------------------------------------------------------
 
 
@@ -124,11 +134,13 @@ bool stop_processing = false;
 // ---------------------------------------------------------------------
 pthread_mutex_t tcp_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t beacon_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t aprs_station_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t cleartoxmit = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
 
 pthread_t Beacon_thread;
 pthread_t Read_thread;
+pthread_t GPSD_thread;
 // ---------------------------------------------------------------------
 
 
@@ -136,7 +148,8 @@ pthread_t Read_thread;
 // ---------------------------------------------------------------------
 void *netreader(void *arg);
 void *beaconthread(void *arg);
-int positpacket(char *buffer, size_t n);
+void *gpsthread(void *arg);
+int positpacket(char *buffer, size_t n, char *info);
 int bitspacket(char *buffer, size_t n);
 int unitspacket(char *buffer, size_t n);
 int parampacket(char *buffer, size_t n);
@@ -179,7 +192,7 @@ int main(int argc,char *argv[])
 
     // Parse through command line arguments
     int c;
-    while((c = getopt(argc,argv,"u:p:I:vh:f:L:G:A:S:O:C:V:B:T:")) != EOF) {
+    while((c = getopt(argc,argv,"u:p:I:vh:f:L:G:A:S:O:C:V:B:T:H:M:")) != EOF) {
         switch(c) {
             case 'f':
                 Logfilename = optarg;
@@ -225,11 +238,17 @@ int main(int argc,char *argv[])
             case 'T':
                 TelemSeqFilename = optarg;
                 break;
+            case 'H':
+                GPSDHost = optarg;
+                break;
+            case 'M':
+                Mobile = optarg;
+                break;
             case 'V':
                 VERSION();
                 exit(EX_OK);
             default:
-                fprintf(stderr,"Usage: %s -u user [-p passcode] [-v] [-I mcast_address][-h host] [-L latitude] [-G longitude] [-A altitude] [-C comment string] [-S symbol char] [-O overlay char] [-B 0|1] [-T telemetry sequence filename]\n",argv[0]);
+                fprintf(stderr,"Usage: %s -u user [-p passcode] [-v] [-I mcast_address][-h host] [-L latitude] [-G longitude] [-A altitude] [-C comment string] [-S symbol char] [-O overlay char] [-B 0|1] [-T telemetry sequence filename] [-H gpsd hostname] [-M 0|1]\n",argv[0]);
                 exit(EX_USAGE);
         }
     }
@@ -281,47 +300,60 @@ int main(int argc,char *argv[])
     // initialize our station details
     initstation(&aprs_station);
 
+    // mobile station or static?
+    format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns());
+    int m = atoi(Mobile);
+    if (m) {
+        ismobile = true;
+        fprintf(Logfile, "%s Mobile station behavior selected.\n", timebuffer);
+    }
+    else 
+        fprintf(Logfile, "%s Static station behavior selected.\n", timebuffer);
+
+
     // Check if beaconing was enabled
-    if (Beaconing) {
-        int b = atoi(Beaconing);
+    int b = atoi(Beaconing);
 
-        if (b <= 0)
-            fprintf(Logfile, "%s Not configured to beacon station position to APRS-IS.  However, will send telemetry data.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
+    if (b > 0) { // beaconing was enabled
 
-        if (b > 0 && Latitude && Longitude && Altitude && Symbol && Overlay && Comment) {
+        beaconing_enabled = true;
 
-            // populate this station's details
-            aprs_station.lat = atof(Latitude);
-            aprs_station.lon = atof(Longitude);
-            aprs_station.alt = atof(Altitude);
+        // get the starting sequence number for telemetry packets sent to the APRS-IS server
+        sequence = readtelemseq(TelemSeqFilename);
+
+        // get timestamp for printing output below
+        format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns());
+        fprintf(Logfile, "%s Beaconing to %s enabled.  Initial telemetry sequence: %d\n", timebuffer, Host, sequence);
+
+        // check the symbol/overlay/comment fields
+        if (Symbol && Overlay && Comment) {
             strncpy(aprs_station.symbol, Symbol, sizeof(aprs_station.symbol)-1);
             strncpy(aprs_station.overlay, Overlay, sizeof(aprs_station.overlay)-1);
             strncpy(aprs_station.comment, Comment, sizeof(aprs_station.comment)-1);
+            fprintf(Logfile, "%s Station identification:  symbol=%s, overlay=%s, comment=%s\n", timebuffer, Symbol, Overlay, Comment);
+        }
 
-            memset(info_string, 0, sizeof(info_string));
-            if(createinfostring(info_string, sizeof(info_string), &aprs_station) <= 0) {
-                beaconing_enabled = false;
-                fprintf(Logfile, "%s Beaconing to APRS-IS disabled\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
-            }
-            else {
-                beaconing_enabled = true;
+        if (GPSDHost == NULL && Latitude && Longitude && Altitude) { // we're using the provided LAT, LON, ALT parameters
 
-                // print out some info
-                format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns());
-                fprintf(Logfile, "%s %s invoked with latitude=%s, longitude=%s, altitude=%s, symbol=%s, overlay=%s, comment=%s\n", timebuffer, argv[0], Latitude, Longitude, Altitude, Symbol, Overlay, Comment);
-                fprintf(Logfile, "%s Location of this station: %.4f, %.4f at %d\n", timebuffer, aprs_station.lat, aprs_station.lon, (int) aprs_station.alt);
-                fprintf(Logfile, "%s Beaconing position packets to %s enabled\n", timebuffer, Host);
-            }
+            gpsd_enabled = false;
+
+            // populate this station's location details
+            aprs_station.lat = atof(Latitude);
+            aprs_station.lon = atof(Longitude);
+            aprs_station.alt = atof(Altitude);
+
+            fprintf(Logfile, "%s Using provided latitude=%s, longitude=%s, altitude=%s\n", timebuffer, Latitude, Longitude, Altitude);
+        }
+        else if (GPSDHost) {
+            gpsd_enabled = true;
+            fprintf(Logfile, "%s Using GPSD on %s for location of this station.\n", timebuffer, GPSDHost);
         }
     }
-    else {
+    else {  // beaconing was not enabled
         beaconing_enabled = false;
-        fprintf(Logfile, "%s Not configured to beacon station position to APRS-IS.  However, will send telemetry data.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
+        fprintf(Logfile, "%s Not configured to beacon to APRS-IS.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
     }
 
-    // get the starting sequence number for telemetry packets sent to the APRS-IS server
-    sequence = readtelemseq(TelemSeqFilename);
-    fprintf(Logfile, "%s Starting telemetry sequence: %d\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), sequence);
 
     // Basically loop until we're supposed stop
     while(!stop_processing) {
@@ -403,9 +435,13 @@ int main(int argc,char *argv[])
         FILE *network = fdopen(Network_fd,"w+");
         setlinebuf(network);
 
-        // start two threads:  1) a thread to read from the APRS-IS server, 2) Beaconing thread that will beacon position (maybe...if beaconing_enabled = true) and telemetry packets to the APRS-IS server
+        // start threads
         pthread_create(&Read_thread,NULL,netreader,NULL);
-        pthread_create(&Beacon_thread,NULL,beaconthread,NULL);
+        if (beaconing_enabled)
+            pthread_create(&Beacon_thread,NULL,beaconthread,NULL);
+        if (gpsd_enabled)
+            pthread_create(&GPSD_thread,NULL,gpsthread,NULL);
+
 
         // Log into the APRS-IS server 
         if(fprintf(network,"user %s pass %s vers KA9Q-aprs 1.0\r\n",User,Passcode) <= 0) {
@@ -636,6 +672,8 @@ int main(int argc,char *argv[])
                 pthread_join(Read_thread,NULL);
                 pthread_cancel(Beacon_thread);
                 pthread_join(Beacon_thread,NULL);
+                pthread_cancel(GPSD_thread);
+                pthread_join(GPSD_thread,NULL);
 
                 // break out of this inner loop
                 break;
@@ -709,6 +747,8 @@ void initstation(APRS_STATION *station)
     station->lat = 0;
     station->lon = 0;
     station->alt = 0;
+    station->course = 0;
+    station->speed = 0;
     memset(station->symbol, 0, sizeof(station->symbol));
     memset(station->overlay, 0, sizeof(station->overlay));
     memset(station->comment, 0, sizeof(station->comment));
@@ -787,7 +827,7 @@ void writetelemseq(char *filename, int seq)
 // ---------------------------------------------------------------------
 // ---------------------------------------------------------------------
 // Construct a packet string for beaconing our position, symbol, and comment.
-int positpacket(char *buffer, size_t n)
+int positpacket(char *buffer, size_t n, char *info)
 {
     // sanity check
     if (buffer == NULL)
@@ -799,7 +839,8 @@ int positpacket(char *buffer, size_t n)
     int minutes = ts->tm_min;
     int seconds = ts->tm_sec;
 
-    return snprintf (buffer, n, "%s>%s,TCPIP*:/%02d%02d%02dh%s", User, tocall, hours, minutes, seconds, info_string);
+    return snprintf (buffer, n, "%s>%s,TCPIP*:/%02d%02d%02dh%s", User, tocall, hours, minutes, seconds, info);
+
 }
 
 
@@ -867,7 +908,8 @@ int createinfostring(char *buffer, size_t n, APRS_STATION *station)
     char lon_ew;
     char lat_string[20];
     char lon_string[20];
-
+    char csespd[8]; // only if this station mobile (ex. ismobile = true)
+                    
     // convert the lat/lon to degrees, decimal minutes
     if (station->lat >= 0)
         lat_ns = 'N';
@@ -901,14 +943,56 @@ int createinfostring(char *buffer, size_t n, APRS_STATION *station)
     snprintf(lon_string, sizeof(lon_string), "%03d%05.2f%c", lon_d, lon_ms, lon_ew);
 
 
+    // construct the course/speed string
+    memset(csespd, 0, sizeof(csespd));
+    if (ismobile) {
+        double c = round(station->course);
+        double s = round(station->speed * 10);
+
+        // only if this station is moving at > 1 MPH
+        if (s > 0) {
+            snprintf (csespd, sizeof(csespd), "%03.0f/%03.0f", c, s);
+        }
+        else 
+            snprintf (csespd, sizeof(csespd), "000/000");
+    }
+
     // Determine if the buffer is shorter than the maximum size for a position report packet
     if (n > MAX_POSIT)
         infosize = MAX_POSIT;
     else
         infosize = n;
 
+
+    // handle the symbol/overlay BS'ery with APRS
+    char sym[2];
+    char ovl[2];
+
+    // clear the buffers
+    sym[0] = sym[1] = ovl[0] = ovl[1] = '\0';
+
+    // is the first character of the symbol the primary or alternate table identifier?
+    if (strncmp(station->symbol, "/", 1) == 0) {
+        // primary table selected
+        sym[0] = station->symbol[1];
+        ovl[0] = '/';
+    }
+    else if (strncmp(station->symbol, "\\", 1) == 0) {
+        // alternate table selected
+        sym[0] = station->symbol[1];
+        if (station->overlay[0] != '\0')
+            ovl[0] = station->overlay[0];
+        else
+            ovl[0] = '\\';
+    }
+    else {
+        // just default to a red dot
+        sym[0] = '/';
+        ovl[0] = '/';
+    }
+    
     // Create the information string, saved to the buffer.  If the comment string is too long, then that is truncated at the 'infosize' mark.
-    num = snprintf(buffer, infosize, "%s%s%s%s/A=%06d%s", lat_string, station->overlay, lon_string, station->symbol, (int) station->alt, station->comment);
+    num = snprintf(buffer, infosize, "%s%s%s%s%s/A=%06d%s", lat_string, ovl, lon_string, sym, csespd, (int) station->alt, station->comment);
 
     // return the number of bytes written to the buffer
     return num;
@@ -996,14 +1080,41 @@ void *beaconthread(void *arg)
 
     // Buffer where we save the position packet that we "might" beacon to the APRS-IS server.
     char packet_string[332]; // the maximum size of an AX.25 UI frame is 332 bytes.
+    char info_string[256];  // max size of the APRS information field
     int ret = 1;
 
-    // This is the number of seconds we wait in between sending packets to the APRS-IS server.
-    int delta = 600;
+    // The maximum amount of time (in seconds) we wait for before sending position packets to the APRS-IS server.
+    int posit_max = 120;
+
+    // we only want to send a set of telemetry packets every 10mins or so.  
+    int telemetry_max = 600;
+
+    // last xmit counters
+    int elapsed_posit = posit_max - 20;
+    int elapsed_telemetry = 0;
+
+    // xmit flags
+    bool xmit_telemetry = false;
+    bool xmit_posit = false;
+
+    // In the case of GPSD, we want to track the position of this station the last time we transmitted
+    double last_lat = 0;
+    double last_lon = 0;
+    double last_alt = 0;
+
+    // buffers 
+    char timestring[1024];
+    char eqns[256];
+    char params[256];
+    char units[256];
+    char bits[256];
+    char telem[256];
+    APRS_EQNS aprs_eqns;
 
     // Create our own stream; there seem to be problems sharing a common stream among threads
     FILE *network = fdopen(Network_fd,"w");
     setlinebuf(network);
+
 
     // We don't want to conenct to the APRS-IS server until our connection to that server was successful.  So we wait until the reader thread has received confirmation from the APRS-IS server and has 
     // signaled that we can continue.
@@ -1017,76 +1128,234 @@ void *beaconthread(void *arg)
     // unlock as we're now clear to xmit to the APRS-IS server
     pthread_mutex_unlock(&beacon_lock);
 
-    // Loop until we can't send data (i.e. something when wrong with talking to the APRS-IS server) or we've been told to stop
+    // Loop until we can't send data (i.e. something went wrong when talking to the APRS-IS server) or we've been told to stop
     while(ret > 0 && !stop_processing) {
 
+        // set the transmit flags
+        xmit_telemetry = false;
+        xmit_posit = false;
+        
+        if (gpsd_enabled) {
 
-        char timestring[1024];
-        char eqns[256];
-        char params[256];
-        char units[256];
-        char bits[256];
-        char telem[256];
-        APRS_EQNS aprs_eqns;
+            // lock the aprs_station structure to determine if our position has changed
+            pthread_mutex_lock(&aprs_station_lock);
+            if (gpsmode >= 3 && (((aprs_station.lat - last_lat > 0.0001 || aprs_station.lon - last_lon > 0.0001 || aprs_station.alt - last_alt > 100) && elapsed_posit > posit_max / 4) || elapsed_posit > posit_max)) {
+                last_lat = aprs_station.lat;
+                last_lon = aprs_station.lon;
+                last_alt = aprs_station.alt;
 
-        // create a position report packet string
-        memset(packet_string, 0, sizeof(packet_string));
-        positpacket(packet_string, sizeof(packet_string));
+                // initialize our info_string buffer
+                memset(info_string, 0, sizeof(info_string));
 
-        // create telemetry packets
-        telemetrypacket(telem, sizeof(telem), &aprs_eqns);
-        eqnpacket(eqns, sizeof(eqns), &aprs_eqns);
-        parampacket(params, sizeof(params));
-        unitspacket(units, sizeof(units));
-        bitspacket(bits, sizeof(bits));
+                // create the information field for this position packet
+                if (createinfostring(info_string, sizeof(info_string), &aprs_station) > 0) {
 
-        // locking the connection to the APRS-IS server.
-        pthread_mutex_lock(&tcp_lock);
+                    // initialize out packet buffer
+                    memset(packet_string, 0, sizeof(packet_string));
 
-        // we only send position packets if we've enable beaconing
-        if (beaconing_enabled) {
+                    // create a new position packet that we can send to the APRS-IS server
+                    positpacket(packet_string, sizeof(packet_string), info_string);
+
+                    // set the xmit flag for position packets.
+                    xmit_posit = true;
+                }
+            }
+
+            // unlock 
+            pthread_mutex_unlock(&aprs_station_lock);
+
+        }
+        else {  // not GPSD enabled, so we'll just look to periodically transmit the static position of this station
+
+            // has it been long enough?
+            if (elapsed_posit > posit_max) {
+
+                // initialize our info_string buffer
+                memset(info_string, 0, sizeof(info_string));
+
+                // create the information field for this position packet
+                if (createinfostring(info_string, sizeof(info_string), &aprs_station) > 0) {
+
+                    // initialize out packet buffer
+                    memset(packet_string, 0, sizeof(packet_string));
+
+                    // create a new position packet that we can send to the APRS-IS server
+                    positpacket(packet_string, sizeof(packet_string), info_string);
+
+                    // set the xmit flag for position packets.
+                    xmit_posit = true;
+                }
+            }
+        }
+
+        // has it been long enough?  ..and it's now time to send a set of telemetry packets the APRS-IS server
+        // For telemetry packets it's simple as we just need to wait a specific amount of time before sending.
+        if (elapsed_telemetry > telemetry_max) {
+
+            // construct telemetry packets
+            telemetrypacket(telem, sizeof(telem), &aprs_eqns);
+            eqnpacket(eqns, sizeof(eqns), &aprs_eqns);
+            parampacket(params, sizeof(params));
+            unitspacket(units, sizeof(units));
+            bitspacket(bits, sizeof(bits));
+
+            xmit_telemetry = true;
+        }
+
+        // lock the connection to the APRS-IS server.
+        if (xmit_posit || xmit_telemetry)
+            pthread_mutex_lock(&tcp_lock);
+
+
+        if (xmit_posit) {
+
+            // Send our position packet to the APRS-IS server
             fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), packet_string);
             ret = fprintf(network, "%s\r\n", packet_string);
-        }
-        else
-            ret = 1;
 
-        // we always send telemetry
-        fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), telem);
-        fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), eqns);
-        fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), params);
-        fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), units);
-        fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), bits);
-
-        if (ret)
-            ret = fprintf(network, "%s\r\n", telem);
-        if (ret)
-            ret = fprintf(network, "%s\r\n", eqns);
-        if (ret)
-            ret = fprintf(network, "%s\r\n", params);
-        if (ret)
-            ret = fprintf(network, "%s\r\n", units);
-        if (ret)
-            ret = fprintf(network, "%s\r\n", bits);
-
-        // Data written, now release our lock.
-        pthread_mutex_unlock(&tcp_lock);
-
-        // If there was an error in writing those packets to the APRS-IS server, then we report to stderr
-        if (ret <= 0 ) {
-            fprintf(stderr, "Error transmitting position or telemetry packets to the APRS-IS server.\n");
+            // reset elapsed time since last transmission.
+            elapsed_posit = 0;
         }
 
-        // sleep for delta secs
-        if (ret > 0) {
+        if (ret && xmit_telemetry) {
+
+            fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), telem);
+            fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), eqns);
+            fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), params);
+            fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), units);
+            fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), bits);
+
+            // send telemetry packets to the APRS-IS server
+            if (ret)
+                ret = fprintf(network, "%s\r\n", telem);
+            if (ret)
+                ret = fprintf(network, "%s\r\n", eqns);
+            if (ret)
+                ret = fprintf(network, "%s\r\n", params);
+            if (ret)
+                ret = fprintf(network, "%s\r\n", units);
+            if (ret)
+                ret = fprintf(network, "%s\r\n", bits);
+
+            // reset the telemetry elapsed counter
+            elapsed_telemetry = 0;
+        }
+
+        // unlock the connection to the APRS-IS server.
+        if (xmit_posit || xmit_telemetry)
+            pthread_mutex_unlock(&tcp_lock);
+
+        // sleep for some small number of seconds
+        if (ret) {
             struct timespec tv;
-            tv.tv_sec = delta;
+            tv.tv_sec = 10;  // 10 seconds
             tv.tv_nsec = 0;
             nanosleep(&tv, NULL);
-        }
 
+            // increment counters
+            elapsed_posit += 10;
+            elapsed_telemetry += 10;
+        }
+        else 
+            fprintf(stderr, "Error sending packet(s) to the APRS-IS server.\n");
     }
 
     return NULL;
 }
 
+
+// the GPS thread
+void *gpsthread(void *arg)
+{
+    pthread_setname("gps-thread");
+
+    // buffer to save timeformatted output
+    char timebuffer[1024];
+
+    // we'll store GPS data in this structure.
+    struct gps_data_t gps_data;
+
+    // number of attempts to connect to GPSD
+    int trycount = 0;
+
+    // GPSD Host possibilities
+    char *gpshost = "localhost";
+
+    // outer loop for (re)connecting to the GPSD instance
+    while (!stop_processing) {
+
+        if (GPSDHost != NULL)
+            gpshost = GPSDHost;
+
+        if (0 != gps_open(gpshost, "2947", &gps_data)) {
+            fprintf(Logfile, "%s Unable to connect to GPSD on %s.  trycount=%d\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), gpshost, trycount);
+
+            // sleep for a few microseconds.  Ramping up the sleep time as the trycount gets large (i.e. we've lost connectivity all together...no sense in just continually retrying).
+            float usecs = 10 * exp(trycount);
+            usleep(usecs);
+        }
+        else {
+            fprintf(Logfile, "%s Connected to GPSD on %s.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), gpshost);
+        }
+
+
+        (void) gps_stream(&gps_data, WATCH_ENABLE | WATCH_JSON, NULL);
+        
+        double change_threshold = .0001;
+        double prev_lat, prev_lon;
+        prev_lat = prev_lon = 0;
+
+        // Loop continuously reading from GPSD
+        while (gps_waiting(&gps_data, 5000000) && !stop_processing) {
+            if (-1 == gps_read(&gps_data, NULL, 0)) {
+                fprintf(Logfile, "%s Unable to read from GPSD on %s.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), gpshost);
+                break;
+            }
+
+            // check that a GPS mode has been set.  If not, then just abort and restart at the top of this inner loop.
+            if (MODE_SET != (MODE_SET & gps_data.set)) {
+                continue;
+            }
+
+            // If the lat/lon is valid, then check if we should update the GPS location variables
+            if (isfinite(gps_data.fix.latitude) && isfinite(gps_data.fix.longitude)) {
+
+                // only update the our GPS position variables if our position has changed by > 0.0001 degrees, and we have a 3D fix.
+                if ((fabs(gps_data.fix.latitude - prev_lat) > change_threshold || fabs(gps_data.fix.longitude - prev_lon) > change_threshold) && gps_data.fix.mode >= 3) {
+
+                    if (Verbose)
+                        fprintf(stdout, "GPS position change: %d %.6f, %.6f\n", gps_data.fix.mode, gps_data.fix.latitude, gps_data.fix.longitude);
+
+
+                    // Update the GPS lat/lon variables on the global aprs_station structure.
+                    pthread_mutex_lock(&aprs_station_lock);
+                    gpsmode = gps_data.fix.mode;
+                    aprs_station.lat = gps_data.fix.latitude;
+                    aprs_station.lon = gps_data.fix.longitude;
+                    aprs_station.alt = gps_data.fix.altitude * 3.2808399; // converted to feet
+                    aprs_station.speed = gps_data.fix.speed * 2.236936; // converted to mph
+                    aprs_station.course = gps_data.fix.track;
+                    pthread_mutex_unlock(&aprs_station_lock);
+
+                }
+                
+                // reset the trycount since we've just read data from the GPS
+                if (trycount > 0) {
+                    fprintf(Logfile, "%s Reconnected to GPSD on %s.  GPS mode: %d.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), gpshost, gps_data.fix.mode);
+                    trycount = 0;
+                }
+
+                prev_lat = gps_data.fix.latitude;
+                prev_lon = gps_data.fix.longitude;
+
+            } 
+        }
+    }
+
+    // When you are done...
+    (void)gps_stream(&gps_data, WATCH_DISABLE, NULL);
+    (void)gps_close(&gps_data);
+    fprintf(Logfile, "%s GPSD thread ended.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
+
+    return NULL;
+}
