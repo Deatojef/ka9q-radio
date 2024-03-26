@@ -757,9 +757,11 @@ void publishdata(ssrcitem_t *ssrc)
         int local_gps_mode = 0;
 
         // get the GPS mode, lat, and lon
+        pthread_mutex_lock(&gps_lock);
         local_gps_mode = gpsmode;
         local_gps_lat = gpslat;
         local_gps_lon = gpslon;
+        pthread_mutex_unlock(&gps_lock);
 
         if (snr > SNR_threshold) {
             db_write(
@@ -823,6 +825,7 @@ void *gpsthread(void *arg)
 {
     pthread_setname("gps-thread");
 
+    // buffer to save timeformatted output
     char timebuffer[1024];
 
     // we'll store GPS data in this structure.
@@ -831,16 +834,26 @@ void *gpsthread(void *arg)
     // number of attempts to connect to GPSD
     int trycount = 0;
 
+    // GPSD Host possibilities
+    char *gpshost = "localhost";
+
     // outer loop for (re)connecting to the GPSD instance
     while (!stop_processing) {
 
-        if (0 != gps_open("localhost", "2947", &gps_data)) {
-            fprintf(Logfile, "%s Unable to connect to GPSD.  trycount=%d\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), trycount);
+        if (GPSDHost != NULL)
+            gpshost = GPSDHost;
+
+        if (0 != gps_open(gpshost, "2947", &gps_data)) {
+            fprintf(Logfile, "%s Unable to connect to GPSD on %s.  trycount=%d\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), gpshost, trycount);
 
             // sleep for a few microseconds.  Ramping up the sleep time as the trycount gets large (i.e. we've lost connectivity all together...no sense in just continually retrying).
             float usecs = 10 * exp(trycount);
             usleep(usecs);
         }
+        else {
+            fprintf(Logfile, "%s Connected to GPSD on %s.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), gpshost);
+        }
+
 
         (void) gps_stream(&gps_data, WATCH_ENABLE | WATCH_JSON, NULL);
         
@@ -851,7 +864,7 @@ void *gpsthread(void *arg)
         // Loop continuously reading from GPSD
         while (gps_waiting(&gps_data, 5000000) && !stop_processing) {
             if (-1 == gps_read(&gps_data, NULL, 0)) {
-                fprintf(Logfile, "%s Unable to read from GPSD.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
+                fprintf(Logfile, "%s Unable to read from GPSD on %s.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), gpshost);
                 break;
             }
 
@@ -880,7 +893,7 @@ void *gpsthread(void *arg)
                 
                 // reset the trycount since we've just read data from the GPS
                 if (trycount > 0) {
-                    fprintf(Logfile, "%s Reconnected to GPSD.  GPS mode: %d.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), gps_data.fix.mode);
+                    fprintf(Logfile, "%s Reconnected to GPSD on %s.  GPS mode: %d.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), gpshost, gps_data.fix.mode);
                     trycount = 0;
                 }
 
