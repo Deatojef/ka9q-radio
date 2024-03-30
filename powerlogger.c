@@ -45,7 +45,7 @@
 // Globals
 static int const DEFAULT_IP_TOS = 48;
 static int const DEFAULT_MCAST_TTL = 1; // LAN only, no routers
-static struct sockaddr_storage Metadata_dest_address;      // Dest of metadata (typically multicast)
+struct sockaddr_storage Metadata_dest_address;      // Dest of metadata (typically multicast)
 int Mcast_ttl = DEFAULT_MCAST_TTL;
 int IP_tos = DEFAULT_IP_TOS;
 int Ctl_fd;
@@ -102,6 +102,7 @@ void publishdata(ssrcitem_t *ssrc);
 ssrcitem_t *parse_int_string(const char *str, int *num_elements);
 static int decode_radio_status(ssrcitem_t *ssrcitem,uint8_t const *buffer,int length);
 void rmch(char *source, char c, char *dest, size_t dest_size);
+static int send_poll(int fd, int ssrc);
 
 
 // Main routine that loops until killed.
@@ -424,8 +425,7 @@ static int init_demod(struct channel *channel)
     channel->fm.pdeviation = channel->linear.cphase = channel->linear.lock_timer = NAN;
     channel->output.gain = NAN;
     channel->tp1 = channel->tp2 = NAN;
-
-    channel->output.data_fd = channel->output.rtcp_fd = -1;
+    //channel->output.data_fd = channel->output.rtcp_fd = -1;
     return 0;
 }
 
@@ -910,4 +910,22 @@ void *gpsthread(void *arg)
     fprintf(Logfile, "%s GPSD thread ended.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
 
     return NULL;
+}
+
+
+// Send empty poll command on specified descriptor
+static int send_poll (int fd, int ssrc) {
+  uint8_t cmdbuffer[128];
+  uint8_t *bp = cmdbuffer;
+  *bp++ = 1; // Command
+
+  uint32_t tag = random();
+  encode_int(&bp,COMMAND_TAG,tag);
+  encode_int(&bp,OUTPUT_SSRC,ssrc); // poll specific SSRC, or request ssrc list with ssrc = 0
+  encode_eol(&bp);
+  int const command_len = bp - cmdbuffer;
+  if(send(fd, cmdbuffer, command_len, 0) != command_len)
+    return -1;
+
+  return 0;
 }
