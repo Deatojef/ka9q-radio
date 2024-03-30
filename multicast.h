@@ -22,20 +22,23 @@
 extern int Mcast_ttl;
 extern int IP_tos;
 
+enum encoding {
+  S16LE = 1,
+  S16BE,
+  OPUS,
+  F32,
+  AX25,
+};
+
 struct pt_table {
   int samprate;
   int channels;
-  enum {
-    S16LE = 1,
-    S16BE,
-    OPUS,
-    F32,
-    AX25,
-  } encoding;
+  enum encoding encoding;
 };
+
 extern struct pt_table PT_table[];
-extern int Opus_pt; // Allow dynamic setting in the future
-extern int AX25_pt;
+extern int const Opus_pt; // Allow dynamic setting in the future
+extern int const AX25_pt;
 
 // Internal representation of RTP header -- NOT what's on wire!
 struct rtp_header {
@@ -130,12 +133,15 @@ int setup_mcast(char const *target,struct sockaddr *,int output,int ttl,int tos,
 static inline int setup_mcast_in(char const *target,struct sockaddr *sock,int offset){
   return setup_mcast(target,sock,0,0,0,offset);
 }
+int join_group(int fd,struct sockaddr const * const sock, char const * const iface,int const ttl,int const tos);
 int connect_mcast(void const *sock,char const *iface,int const ttl,int const tos);
 int listen_mcast(void const *sock,char const *iface);
 int resolve_mcast(char const *target,void *sock,int default_port,char *iface,int iface_len);
 int setportnumber(void *sock,uint16_t port);
 int getportnumber(void const *sock);
 int address_match(void const *arg1,void const *arg2);
+
+int add_pt(int type, int samprate, int channels, enum encoding encoding);
 
 // Function to process incoming RTP packet headers
 // Returns number of samples dropped or skipped by silence suppression, if any

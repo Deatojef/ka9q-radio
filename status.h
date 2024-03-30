@@ -19,22 +19,22 @@ enum pkt_type {
 // with each other until they are all recompiled
 enum status_type {
   EOL = 0,	  
-  COMMAND_TAG,    // Echoes tag from requester
+  COMMAND_TAG,   // Echoes tag from requester
   CMD_CNT,       // Count of input commands
-  GPS_TIME,       // Nanoseconds since GPS epoch (remember to update the leap second tables!)
+  GPS_TIME,      // Nanoseconds since GPS epoch (remember to update the leap second tables!)
 
-  DESCRIPTION,    // Free form text describing source
-  INPUT_DATA_SOURCE_SOCKET,
-  INPUT_DATA_DEST_SOCKET,
-  INPUT_METADATA_SOURCE_SOCKET,
-  INPUT_METADATA_DEST_SOCKET,
-  INPUT_SSRC,
+  DESCRIPTION,   // Free form text describing source
+  UNUSED0,
+  UNUSED1,
+  UNUSED2,
+  UNUSED3,
+  UNUSED4,
   INPUT_SAMPRATE, // Nominal sample rate (integer)
-  INPUT_METADATA_PACKETS,
-  INPUT_DATA_PACKETS,
+  UNUSED6,
+  UNUSED7,
   INPUT_SAMPLES,
-  INPUT_DROPS,
-  INPUT_DUPES,
+  UNUSED8,
+  UNUSED9,
 
   OUTPUT_DATA_SOURCE_SOCKET,
   OUTPUT_DATA_DEST_SOCKET,
@@ -45,7 +45,7 @@ enum status_type {
   OUTPUT_DATA_PACKETS,
 
   // Hardware
-  AD_LEVEL,    // NO LONGER USED - use IF_POWER instead
+  UNUSED22,
   CALIBRATE,
   // Hardware-specific analog gains
   LNA_GAIN,
@@ -72,7 +72,7 @@ enum status_type {
   KAISER_BETA,
   FILTER_BLOCKSIZE,
   FILTER_FIR_LENGTH,
-  NOISE_BANDWIDTH,
+  UNUSED17,
 
   // Signals
   IF_POWER,
@@ -89,7 +89,7 @@ enum status_type {
   PLL_PHASE,      // Linear PLL
   PLL_BW,         // PLL loop bandwidth
   ENVELOPE,       // Envelope detection in linear mode
-  FM_FLAT,
+  UNUSED18,
   
   // Demodulation status
   DEMOD_SNR,      // FM, PLL linear
@@ -102,19 +102,19 @@ enum status_type {
   HEADROOM,       // Audio level headroom, stored as amplitude ratio, exchanged as dB
   AGC_HANGTIME,   // AGC hang time, stored as samples, exchanged as sec
   AGC_RECOVERY_RATE, // stored as amplitude ratio/sample, exchanged as dB/sec
-  AGC_ATTACK_RATE, // stored as amplitude ratio/sample, exchanged as dB/sec
+  UNUSED19,
   AGC_THRESHOLD,   // stored as amplitude ratio, exchanged as dB
 
   GAIN,     // AM, Linear only, stored as amplitude ratio, exchanged as dB
   OUTPUT_LEVEL,     // All modes
   OUTPUT_SAMPLES,
 
-  OPUS_SOURCE_SOCKET,
-  OPUS_DEST_SOCKET,
-  OPUS_SSRC,
-  OPUS_TTL,
-  OPUS_BITRATE,
-  OPUS_PACKETS,
+  UNUSED11,
+  UNUSED12,
+  UNUSED13,
+  UNUSED14,
+  UNUSED15,
+  UNUSED16,
 
   FILTER_DROPS,
   LOCK,     // Tuner is locked, will ignore retune commands (boolean)
@@ -134,22 +134,23 @@ enum status_type {
   THRESH_EXTEND,    // threshold extension enable (FM only)
 
   // Spectral analysis
-  COHERENT_BIN_BW,  // block rate in Hz
+  UNUSED20,
   COHERENT_BIN_SPACING, // (1-overlap) * block rate = (1 - ((M-1)/(L+M-1))) * block rate
   NONCOHERENT_BIN_BW, // Bandwidth (Hz) of noncoherent integration bin, some multiple of COHERENT_BIN_SPACING
   BIN_COUNT,        // Integer number of bins accumulating energy noncoherently
-  INTEGRATE_TC,   // Integration time constant, sec (no longer used)
+  UNUSED21,
   BIN_DATA,         // Vector of relative bin energies, real (I^2 + Q^2)
 
   RF_ATTEN,       // Front end attenuation (introduced with rx888)
   RF_GAIN,        // Front end gain (introduced with rx888)
-  OUTPUT_DATA_UNIX_SOCKET,  // For use with local (AF_UNIX) data paths - BAD idea, not used
+  UNUSED10,
   FE_LOW_EDGE,    // edges of front end filter
   FE_HIGH_EDGE,
   FE_ISREAL,        // Boolean, true -> front end uses real sampling, false -> front end uses complex
   BLOCKS_SINCE_POLL,  // Blocks since last poll
-  AD_OVER,          // A/D full scale samples
+  AD_OVER,          // A/D full scale samples, proxy for overranges
   RTP_PT,           // Real Time Protocol Payload Type
+  STATUS_RATE,      // Automatically send channel status over *data* channel every STATUS_RATE frames
 };
 
 int encode_string(uint8_t **bp,enum status_type type,void const *buf,unsigned int buflen);
@@ -168,6 +169,7 @@ uint64_t decode_int64(uint8_t const *,int);
 uint32_t decode_int32(uint8_t const *,int);
 uint16_t decode_int16(uint8_t const *,int);
 uint8_t decode_int8(uint8_t const *,int);
+bool decode_bool(uint8_t const *,int);
 int decode_int(uint8_t const *,int);
 
 float decode_float(uint8_t const *,int);
@@ -179,6 +181,5 @@ uint32_t get_ssrc(uint8_t const *buffer,int length);
 uint32_t get_tag(uint8_t const *buffer,int length);
 
 void dump_metadata(FILE *,uint8_t const *,int,bool);
-int send_poll(int fd,int ssrc);
 
 #endif

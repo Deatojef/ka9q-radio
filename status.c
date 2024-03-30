@@ -233,6 +233,10 @@ uint16_t decode_int16(uint8_t const *cp,int len){
 uint8_t decode_int8(uint8_t const *cp,int len){
   return decode_int64(cp,len) & 0xff;
 }
+bool decode_bool(uint8_t const *cp,int len){
+  return decode_int64(cp,len) ? true : false;
+}
+
 int decode_int(uint8_t const *cp,int len){
   return decode_int64(cp,len) & UINT_MAX; // mask to the size of an int
 }
@@ -314,22 +318,6 @@ struct sockaddr *decode_socket(void *sock,uint8_t const *val,int optlen){
   return NULL;
 }
 
-// Send empty poll command on specified descriptor
-int send_poll(int fd,int ssrc){
-  uint8_t cmdbuffer[128];
-  uint8_t *bp = cmdbuffer;
-  *bp++ = 1; // Command
-
-  uint32_t tag = random();
-  encode_int(&bp,COMMAND_TAG,tag);
-  encode_int(&bp,OUTPUT_SSRC,ssrc); // poll specific SSRC, or request ssrc list with ssrc = 0
-  encode_eol(&bp);
-  int const command_len = bp - cmdbuffer;
-  if(send(fd, cmdbuffer, command_len, 0) != command_len)
-    return -1;
-
-  return 0;
-}
 
 
 // Extract SSRC; 0 means not present (reserved value)

@@ -46,8 +46,8 @@ struct pt_table PT_table[128] = {
 { 0, 0, 0 }, // 7
 { 0, 0, 0 }, // 8
 { 0, 0, 0 }, // 9
-{ 48000, 2, 2 }, // 10
-{ 48000, 1, 2 }, // 11
+{ 48000, 2, S16BE }, // 10
+{ 48000, 1, S16BE }, // 11
 { 0, 0, 0 }, // 12
 { 0, 0, 0 }, // 13
 { 0, 0, 0 }, // 14
@@ -147,22 +147,22 @@ struct pt_table PT_table[128] = {
 { 0, 0, 0 }, // 108
 { 0, 0, 0 }, // 109
 { 0, 0, 0 }, // 110
-{ 48000, 2, 3 }, // 111  Opus always uses a 48K virtual sample rate
+{ 48000, 2, OPUS }, // 111  Opus always uses a 48K virtual sample rate
 { 0, 0, 0 }, // 112
 { 0, 0, 0 }, // 113
 { 0, 0, 0 }, // 114
 { 0, 0, 0 }, // 115
-{ 24000, 1, 2 }, // 116
-{ 24000, 2, 2 }, // 117 
+{ 24000, 1, S16BE }, // 116
+{ 24000, 2, S16BE }, // 117 
 { 0, 0, 0 }, // 118
-{ 16000, 1, 2 }, // 119
-{ 16000, 2, 2 }, // 120 
+{ 16000, 1, S16BE }, // 119
+{ 16000, 2, S16BE }, // 120 
 { 0, 0, 0 }, // 121
-{ 12000, 1, 2 }, // 122
-{ 12000, 2, 2 }, // 123
+{ 12000, 1, S16BE }, // 122
+{ 12000, 2, S16BE }, // 123
 { 0, 0, 0 }, // 124
-{ 8000, 1, 2 }, // 125
-{ 8000, 2, 2 }, // 126
+{ 8000, 1, S16BE }, // 125
+{ 8000, 2, S16BE }, // 126
 { 0, 0, 0 }, // 127
 };
 
@@ -170,142 +170,22 @@ struct pt_table PT_table[128] = {
 #define OPUS_PT (111) // Hard-coded NON-standard payload type for OPUS (should be dynamic with sdp)
 
 
-int Opus_pt = OPUS_PT;
-int AX25_pt = AX25_PT;
+int const Opus_pt = OPUS_PT;
+int const AX25_pt = AX25_PT;
 
-
-#ifdef BOOT // bootstrap new payload type table - take out eventually
-
-// Moved here from multicast.h so applications can't see them
-// Eventually phase all these out in favor of dynamic allocation
-#define PCM_STEREO_PT (10)        // 48 kHz (or other) flat stereo baseband audio OR I/Q baseband audio OR I/Q IF stream
-#define PCM_MONO_PT (11)          // 48 kHz (or other) flat mono baseband audio OR real-only IF stream
-#define PCM_MONO_24_PT (116)      // 24 kHz mono PCM, flat
-#define PCM_STEREO_24_PT (117)    // 24 kHz stereo PCM, flat
-#define PCM_MONO_16_PT (119)      // 16 kHz mono PCM, flat
-#define PCM_STEREO_16_PT (120)    // 16 kHz stereo PCM, flat
-#define PCM_MONO_12_PT (122)      // 12 kHz mono PCM, flat
-#define PCM_STEREO_12_PT (123)    // 12 kHz stereo PCM, flat
-#define PCM_MONO_8_PT (125)       // 8 kHz mono PCM, flat
-#define PCM_STEREO_8_PT (126)     // 8 kHz stereo PCM, flat
-
-
-static int old_channels_from_pt(int const type);
-static int old_samprate_from_pt(int const type);
-static int old_pt_from_info(int const samprate,int const channels);
-
-// [samprate][channels]
-// Not all combinations are supported or useful,
-// e.g., wideband FM is always 48 kHz, FM is always mono
-static int old_pt_table[5][2] = {
-  {  PCM_MONO_8_PT, PCM_STEREO_8_PT  },
-  {  PCM_MONO_12_PT, PCM_STEREO_12_PT },
-  {  PCM_MONO_16_PT, PCM_STEREO_16_PT },
-  {  PCM_MONO_24_PT, PCM_STEREO_24_PT },
-  {  PCM_MONO_PT, PCM_STEREO_PT },
-};
-
-// Determine sample rate from RTP payload type
-static int old_samprate_from_pt(int const type){
-  switch(type){
-  case PCM_MONO_PT:
-  case PCM_STEREO_PT:
-  case OPUS_PT: // Internally 48 kHz, though not really applicable
-    return 48000;
-  case PCM_MONO_24_PT:
-  case PCM_STEREO_24_PT:
-    return 24000;
-  case PCM_MONO_16_PT:
-  case PCM_STEREO_16_PT:
-    return 16000;
-  case PCM_MONO_12_PT:
-  case PCM_STEREO_12_PT:
-    return 12000;
-  case PCM_MONO_8_PT:
-  case PCM_STEREO_8_PT:
-    return 8000;
-  default:
+// Add an encoding to the RTP payload type table
+// The mappings are typically extracted from a radiod status channel and kept in a table so they can
+// be changed midstream without losing anything
+int add_pt(int type, int samprate, int channels, enum encoding encoding){
+  if(type >= 0 && type < 128){
+    PT_table[type].channels = channels;
+    PT_table[type].samprate = samprate;
+    PT_table[type].encoding = encoding;
     return 0;
-  }
-}
-
-static int old_channels_from_pt(int const type){
-  switch(type){
-  case PCM_MONO_PT:
-  case PCM_MONO_24_PT:
-  case PCM_MONO_16_PT:
-  case PCM_MONO_12_PT:
-  case PCM_MONO_8_PT:
-    return 1;
-  case PCM_STEREO_PT:
-  case OPUS_PT:
-  case PCM_STEREO_24_PT:
-  case PCM_STEREO_16_PT:
-  case PCM_STEREO_12_PT:
-  case PCM_STEREO_8_PT:
-    return 2;
-  default:
-    return 0;
-  }
-}
-
-static int old_pt_from_info(int const samprate,int const channels){
-  int s;
-  switch(samprate){
-  case 8000:
-    s = 0;
-    break;
-  case 12000:
-    s = 1;
-    break;
-  case 16000:
-    s = 2;
-    break;
-  case 24000:
-    s = 3;
-    break;
-    // other sample rates also use the original RTP definitions, so it's really "unspecified"
-  case 48000:
-  default:
-    s = 4;
-    break;
-  }
-  if(channels < 1 || channels > 2)
+  } else
     return -1;
-
-  return old_pt_table[s][channels-1];
 }
 
-static bool pt_init = false;
-
-void init_new_pt(void){
-  if(pt_init)
-     return;
-
-  int samprates[] = { 8000, 12000, 16000, 24000, 48000};
-  for(int chan = 1;chan <= 2; chan++){
-    for(int i= 0; i < 5;i++){
-      int type = old_pt_from_info(samprates[i],chan);
-      if(type >= 0){
-	PT_table[type].channels = old_channels_from_pt(type);
-	PT_table[type].samprate = old_samprate_from_pt(type);
-	PT_table[type].encoding = S16BE; // default 16-bit linear PCM big endian
-      }
-    }
-  }
-  PT_table[OPUS_PT].encoding = OPUS;
-  Opus_pt = OPUS_PT;
-  PT_table[AX25_PT].encoding = AX25;
-  AX25_pt = AX25_PT;
-
-  pt_init = true;
-  printf("struct pt_table PT_table[128] = {\n");
-  for(int i=0; i < 128; i++){
-    printf("{ %d, %d, %d }, // %d\n",PT_table[i].samprate,PT_table[i].channels,PT_table[i].encoding,i);
-  }
-  printf("};\n");
-}
-#endif
 
 // This is a bit messy. Is there a better way?
 char const *Default_mcast_iface;
@@ -343,6 +223,32 @@ int setup_mcast(char const * const target,struct sockaddr *sock,int const output
     return connect_mcast(sock,iface,ttl,tos);
 }
 
+// Join an existing socket to a multicast group without connecting it
+// Primarily useful for solving the smart switch problem described in connect_mcast() with unconnected sockets used with sendto()
+// Since many channels may send to the same multicast group, the joins can often fail with harmless "address already in use" messages
+// Note: only the IP address is significant, the port number is ignored
+int join_group(int fd,struct sockaddr const * const sock, char const * const iface,int const ttl,int const tos){
+  if(fd == -1 || sock == NULL)
+    return -1;
+
+  switch(sock->sa_family){
+  case AF_INET:
+    set_ipv4_options(fd,ttl,tos);
+    if(ipv4_join_group(fd,sock,iface) != 0)
+      fprintf(stderr,"connect_mcast join_group failed\n");
+    break;
+  case AF_INET6:
+    set_ipv6_options(fd,ttl,tos);
+    if(ipv6_join_group(fd,sock,iface) != 0)
+      fprintf(stderr,"connect_mcast join_group failed\n");
+    break;
+  default:
+    return -1;
+  }
+  return 0;
+}
+
+
 // Create a socket for sending to a multicast group
 int connect_mcast(void const * const s,char const * const iface,int const ttl,int const tos){
   if(s == NULL)
@@ -369,20 +275,9 @@ int connect_mcast(void const * const s,char const * const iface,int const ttl,in
   // But if the switches are set to pass unregistered multicasts, then IPv4 multicasts
   // that aren't subscribed to by anybody are flooded everywhere!
   // We avoid that by subscribing to our own multicasts.
-  switch(sock->sa_family){
-  case AF_INET:
-    set_ipv4_options(fd,ttl,tos);
-    if(ipv4_join_group(fd,sock,iface) != 0)
-      fprintf(stderr,"connect_mcast join_group failed\n");
-    break;
-  case AF_INET6:
-    set_ipv6_options(fd,ttl,tos);
-    if(ipv6_join_group(fd,sock,iface) != 0)
-      fprintf(stderr,"connect_mcast join_group failed\n");
-    break;
-  default:
+  if(join_group(fd,sock,iface,ttl,tos) == -1)
     return -1;
-  }
+
   if(connect(fd,sock,sizeof(struct sockaddr)) == -1){
     close(fd);
     return -1;
@@ -904,7 +799,7 @@ static int ipv4_join_group(int const fd,void const * const sock,char const * con
     mreqn.imr_ifindex = 0;
   else
     mreqn.imr_ifindex = if_nametoindex(iface);
-  if(setsockopt(fd,IPPROTO_IP,IP_ADD_MEMBERSHIP,&mreqn,sizeof(mreqn)) != 0){
+  if(setsockopt(fd,IPPROTO_IP,IP_ADD_MEMBERSHIP,&mreqn,sizeof(mreqn)) != 0 && errno != EADDRINUSE){
     perror("multicast v4 join");
     return -1;
   }
@@ -931,7 +826,7 @@ static int ipv6_join_group(int const fd,void const * const sock,char const * con
 #ifndef IPV6_ADD_MEMBERSHIP
 #define IPV6_ADD_MEMBERSHIP IPV6_JOIN_GROUP      
 #endif
-  if(setsockopt(fd,IPPROTO_IP,IPV6_ADD_MEMBERSHIP,&ipv6_mreq,sizeof(ipv6_mreq)) != 0){
+  if(setsockopt(fd,IPPROTO_IP,IPV6_ADD_MEMBERSHIP,&ipv6_mreq,sizeof(ipv6_mreq)) != 0 && errno != EADDRINUSE){
     perror("multicast v6 join");
     return -1;
   }

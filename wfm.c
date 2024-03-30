@@ -255,6 +255,7 @@ void *demod_wfm(void *arg){
       assert(chan->output.channels == 2); // Has to be, to get here
       if(send_output(chan,(const float *)stereo_buffer,audio_L,false) < 0)
 	break; // No output stream! Terminate
+      data_channel_status(chan);
     } else { // pilot_present == false
       // Mono processing
       float output_level = 0;
@@ -284,6 +285,7 @@ void *demod_wfm(void *arg){
       if(send_output(chan,mono->output.r,audio_L,false) < 0)
 	break; // No output stream! Terminate
       chan->output.channels = channels_save;
+      data_channel_status(chan);
     }
   } // while(!chan->terminate)
  quit:;

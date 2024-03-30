@@ -34,6 +34,7 @@
 #include <iniparser/iniparser.h>
 #include <sysexits.h>
 #include <errno.h>
+#include <fcntl.h>
 
 #include "avahi.h"
 #include "misc.h"
@@ -51,15 +52,14 @@ static char Locale[256] = "en_US.UTF-8";
 static char const *Presets_file = "presets.conf"; // make configurable!
 static dictionary *Pdict;
 struct frontend Frontend;
-static struct sockaddr_storage Metadata_source_address;      // Source of metadata
-static struct sockaddr_storage Metadata_dest_address;      // Dest of metadata (typically multicast)
+struct sockaddr_storage Metadata_source_address;      // Source of metadata
+struct sockaddr_storage Metadata_dest_address;      // Dest of metadata (typically multicast)
 static uint64_t Block_drops; // Stored in output filter on sender, not in channel structure
 
 int Mcast_ttl = DEFAULT_MCAST_TTL;
 int IP_tos = DEFAULT_IP_TOS;
 float Blocktime;
-int Ctl_fd,Status_fd;
-uint64_t Metadata_packets;
+int Output_fd,Status_fd;
 const char *App_path;
 int Verbose;
 
@@ -70,6 +70,7 @@ static struct control {
 } Control;
 
 
+static int send_poll(int ssrc);
 static int pprintw(WINDOW *w,int y, int x, char const *prefix, char const *fmt, ...);
 
 static WINDOW *Tuning_win,*Sig_win,*Filtering_win,*Demodulator_win,
@@ -87,7 +88,7 @@ static void display_output(WINDOW *output,struct channel const *channel);
 static int process_keyboard(struct channel *,uint8_t **bpp,int c);
 static void process_mouse(struct channel *channel,uint8_t **bpp);
 static int decode_radio_status(struct channel *channel,uint8_t const *buffer,int length);
-static int for_us(struct channel *channel,uint8_t const *buffer,int length,uint32_t ssrc);
+static bool for_us(struct channel *channel,uint8_t const *buffer,int length,uint32_t ssrc);
 static int init_demod(struct channel *channel);
 
 // Pop up a temporary window with the contents of a file in the
@@ -248,7 +249,7 @@ static struct windef {
   {&Sig_win,15,25},
   {&Demodulator_win,15,26},
   {&Filtering_win,15,22},
-  {&Output_win,16,45},
+  {&Output_win,17,45},
 };
 #define NWINS (sizeof(Windefs) / sizeof(Windefs[0]))
 
@@ -304,6 +305,7 @@ static void setup_windows(void){
   wprintw(Debug_win,"Copyright 2023, Phil Karn, KA9Q. May be used under the terms of the GNU Public License\n");
 }
 
+// Comparison for sorting by SSRC
 static int chan_compare(void const *a,void const *b){
   struct channel const *da = *(struct channel **)a;
   struct channel const *db = *(struct channel **)b;
@@ -318,7 +320,6 @@ static int chan_compare(void const *a,void const *b){
 
 
 static uint32_t Ssrc = 0;
-static bool Use_browser = false;
 
 // Thread to display receiver state, updated at 10Hz by default
 // Uses the ancient ncurses text windowing library
@@ -356,21 +357,24 @@ int main(int argc,char *argv[]){
     }
   }
   setlocale(LC_ALL,Locale); // Set either the hardwired default or the value of $LANG if it exists
-  char *target = NULL;
+  char const *target = argc > optind ? argv[optind] : NULL;
 
-  if(argc > optind)
-    target = argv[optind];
-  else
-    Use_browser = true;
+  Output_fd = socket(AF_INET,SOCK_DGRAM,0); // Eventually intended for all output with sendto()
+  if(Output_fd < 0){
+    fprintf(stdout,"can't create output socket: %s\n",strerror(errno));
+    exit(EX_OSERR); // let systemd restart us
+  }
+  fcntl(Output_fd,F_SETFL,O_NONBLOCK); // Just drop instead of blocking real time
 
-  if(Use_browser){
+  if(target == NULL){
     // Use avahi browser to find a radiod instance to control
     fprintf(stdout,"Scanning for radiod instances...\n");
-    struct service_tab table[1000];
+    int const table_size = 1000;
+    struct service_tab table[table_size];
 
-    int radiod_count = avahi_browse(table,1000,"_ka9q-ctl._udp"); // Returns list in global when cache is emptied
+    int radiod_count = avahi_browse(table,table_size,"_ka9q-ctl._udp"); // Returns list in global when cache is emptied
     if(radiod_count == 0){
-      fprintf(stdout,"No radiod targets, or Avahi not running, ; specify control channel manually\n");
+      fprintf(stdout,"No radiod instances or Avahi not running; specify control channel manually\n");
       exit(EX_UNAVAILABLE);
     }
     if(radiod_count == 1){
@@ -386,32 +390,50 @@ int main(int argc,char *argv[]){
 	fprintf(stdout,"EOF on input\n");
 	exit(EX_USAGE);
       }
-      int n = strtol(line,NULL,0);
+      int const n = strtol(line,NULL,0);
       if(n < 0 || n >= radiod_count){
 	fprintf(stdout,"Index %d out of range, try again\n",n);
 	exit(EX_USAGE);
       }
-      int port = strtol(table[n].port,NULL,0);
-      // 'avahi-browse' returns the IP address, port and interface so we don't have to resolve them
-      // So this call to resolve_mcast() could be a direct conversion using a sockaddr utility
-      resolve_mcast(table[n].address,&Metadata_dest_address,port,NULL,0);
+      struct addrinfo *results = NULL;
+      struct addrinfo hints;
+      memset(&hints,0,sizeof(hints));
+      hints.ai_family = AF_INET; // IPv4 for now
+      hints.ai_socktype = SOCK_DGRAM;
+      hints.ai_protocol = IPPROTO_UDP;
+      hints.ai_flags = AI_ADDRCONFIG | AI_NUMERICHOST | AI_NUMERICSERV;
+      int const ecode = getaddrinfo(table[n].address,table[n].port,&hints,&results);
+      if(ecode != 0){
+	fprintf(stdout,"getaddrinfo: %s\n",gai_strerror(ecode));
+	exit(EX_IOERR);
+      }
+      // Use first entry on list -- much simpler
+      // I previously tried each entry in turn until one succeeded, but with UDP sockets and
+      // flags set to only return supported addresses, how could any of them fail?
+      memcpy(&Metadata_dest_address,results->ai_addr,sizeof(Metadata_dest_address));
+      freeaddrinfo(results); results = NULL;
       Status_fd = listen_mcast(&Metadata_dest_address,table[n].interface);
-      Ctl_fd = connect_mcast(&Metadata_dest_address,table[n].interface,Mcast_ttl,IP_tos);
+      join_group(Output_fd,(struct sockaddr *)&Metadata_dest_address,table[n].interface,Mcast_ttl,IP_tos);
     }
   } else {
     // Use resolv_mcast to resolve a manually entered domain name, using default port and parsing possible interface
     char iface[1024]; // Multicast interface
     resolve_mcast(target,&Metadata_dest_address,DEFAULT_STAT_PORT,iface,sizeof(iface));
     Status_fd = listen_mcast(&Metadata_dest_address,iface);
-    Ctl_fd = connect_mcast(&Metadata_dest_address,iface,Mcast_ttl,IP_tos);
+    join_group(Output_fd,(struct sockaddr *)&Metadata_dest_address,iface,Mcast_ttl,IP_tos);
   }
   if(Status_fd < 0){
     fprintf(stderr,"Can't listen to mcast status channel: %s\n",strerror(errno));
     exit(EX_IOERR);
   }
-  if(Ctl_fd < 0){
-    fprintf(stderr,"Can't send to mcast control channel: %s\n",strerror(errno));
-    exit(EX_IOERR);
+  {
+    // All reads from the status channel will have a timeout
+    // Should this be configurable?
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 200000; // 200k microsec = 200 millisec
+    if(setsockopt(Status_fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout)) == -1)
+      perror("setsock timeout");
   }
   char presetsfile_path[PATH_MAX];
   if (dist_path(presetsfile_path,sizeof(presetsfile_path),Presets_file) == -1) {
@@ -424,41 +446,34 @@ int main(int argc,char *argv[]){
     exit(EX_NOINPUT);
   }
   atexit(display_cleanup);
+  
   while(Ssrc == 0){
     // None specified, get a list, let user choose
 
-    send_poll(Ctl_fd,0xffffffff);
+    send_poll(0xffffffff);
     // Read responses
-    struct channel **channels = (struct channel **)calloc(1024,sizeof(struct channel *));
+    int const chan_max = 1024;
+    struct channel **channels = (struct channel **)calloc(chan_max,sizeof(struct channel *));
 
     int chan_count;
-    for(chan_count = 0; chan_count < 1024;){
-      int const npoll = 1;
-      struct pollfd pollfd[npoll];
-      pollfd[0].fd = Status_fd;
-      pollfd[0].events = POLLIN;
+    for(chan_count = 0; chan_count < chan_max;){
+      struct sockaddr_storage source_address;
+      socklen_t ssize = sizeof(source_address);
+      uint8_t buffer[PKTSIZE];	
+      int length = recvfrom(Status_fd,buffer,sizeof(buffer),0,(struct sockaddr *)&source_address,&ssize); // should not block
+      if(length == -1 && errno == EAGAIN)
+	break; // Timeout; we're done
+      // Ignore our own command packets
+      if(length < 2 || (enum pkt_type)buffer[0] != STATUS)
+	continue; // recvfrom timeout will return length = -1 and errno = EAGAIN
       
-      int n = poll(pollfd,npoll,100);
-      if(n <= 0)
-	break; // Timeout or failure
-      
-      if(pollfd[0].revents & POLLIN){
-	struct sockaddr_storage source_address;
-	socklen_t ssize = sizeof(source_address);
-	uint8_t buffer[PKTSIZE];	
-	int length = recvfrom(Status_fd,buffer,sizeof(buffer),0,(struct sockaddr *)&source_address,&ssize); // should not block
-	// Ignore our own command packets
-	if(length >= 2 && (enum pkt_type)buffer[0] == STATUS){
-	  // What to do with the source addresses?
-	  memcpy(&Metadata_source_address,&source_address,sizeof(Metadata_source_address));
-	  struct channel * const channel = calloc(1,sizeof(struct channel));
-	  init_demod(channel);
-	  decode_radio_status(channel,buffer+1,length-1);
-	  channels[chan_count++] = channel;
-	}
-      }
+      // What to do with the source addresses?
+      memcpy(&Metadata_source_address,&source_address,sizeof(Metadata_source_address));
+      struct channel * const channel = calloc(1,sizeof(struct channel));
+      init_demod(channel);
+      decode_radio_status(channel,buffer+1,length-1);
+      channels[chan_count++] = channel;
     }
-    fprintf(stdout,"%d channels\n",chan_count);
     qsort(channels,chan_count,sizeof(channels[0]),chan_compare);
 
     fprintf(stdout,"Channel list:\n");
@@ -470,30 +485,13 @@ int main(int argc,char *argv[]){
 	continue;
 
       float const noise_bandwidth = fabsf(channel->filter.max_IF - channel->filter.min_IF);
-      float const sig_power = channel->sig.bb_power - noise_bandwidth * channel->sig.n0;
+      float sig_power = channel->sig.bb_power - noise_bandwidth * channel->sig.n0;
+      if(sig_power < 0)
+	sig_power = 0; // Avoid log(-x) = nan
       float const sn0 = sig_power/channel->sig.n0;
       float const snr = power2dB(sn0/noise_bandwidth);
       char const *ip_addr_string = formatsock(&channel->output.data_dest_address);
-      char resolve_command[256];
-      snprintf(resolve_command,sizeof(resolve_command),"avahi-resolve-address %s",ip_addr_string);
-      {
-	char *cp = strchr(resolve_command,':'); // Remove :port field
-	if(cp != NULL)
-	  *cp = '\0';
-      }
-      FILE *fp = popen(resolve_command,"r");
-      char addr_and_name[256];
-      if(fp != NULL)
-	fgets(addr_and_name,sizeof(addr_and_name),fp);
-      else
-	strlcpy(addr_and_name,ip_addr_string,sizeof(addr_and_name));
-      pclose(fp);
-      {
-	char *cp = strchr(addr_and_name,'\n'); // eliminate newline at end of command output
-	if(cp != NULL)
-	  *cp = '\0';
-      }
-      fprintf(stdout,"%'13u %9s %'13.f %5.1f %s\n",channel->output.rtp.ssrc,channel->preset,channel->tune.freq,snr,addr_and_name);
+      fprintf(stdout,"%13u %9s %'13.f %5.1f %s\n",channel->output.rtp.ssrc,channel->preset,channel->tune.freq,snr,ip_addr_string);
       last_ssrc = channel->output.rtp.ssrc;
     }
     fprintf(stdout,"Choose SSRC or create new: ");
@@ -517,6 +515,7 @@ int main(int argc,char *argv[]){
   }
   struct channel Channel;
   struct channel *channel = &Channel;
+  init_demod(channel);
 
   // Set up display subwindows
   Tty = fopen("/dev/tty","r+");
@@ -531,8 +530,6 @@ int main(int argc,char *argv[]){
   mmask_t const mask = ALL_MOUSE_EVENTS;
   mousemask(mask,NULL);
   setup_windows();
-
-
 
   Frontend.frequency = Frontend.min_IF = Frontend.max_IF = NAN;
 
@@ -555,7 +552,7 @@ int main(int argc,char *argv[]){
     int64_t const radio_poll_interval = Refresh_rate * BILLION; // Can change from the keyboard
     if(now >= next_radio_poll){
       // Time to poll radio
-      send_poll(Ctl_fd,Ssrc);
+      send_poll(Ssrc);
 #ifdef DEBUG_POLL
       wprintw(Debug_win,"poll sent %lld\n",now);
 #endif
@@ -569,37 +566,26 @@ int main(int argc,char *argv[]){
     uint8_t buffer[PKTSIZE];
     int length = 0;
     do {
-      int const npoll = 1;
-      struct pollfd pollfd[npoll];
-      pollfd[0].fd = Status_fd;
-      pollfd[0].events = POLLIN;
-
-      int n = poll(pollfd,npoll,100);
       now = gps_time_ns(); // poll() blocks, so update the time of day (only place we block)
-      if(n < 0){
-	wprintw(Debug_win,"poll() failure, %s\n",strerror(errno));
-	screen_update_needed = true;
-      }
-      if(pollfd[0].revents & POLLIN){
-	// Message from the radio program (or some transcoders)
-	struct sockaddr_storage source_address;
-	socklen_t ssize = sizeof(source_address);
-	length = recvfrom(Status_fd,buffer,sizeof(buffer),0,(struct sockaddr *)&source_address,&ssize); // should not block
-	// Ignore our own command packets and responses to other SSIDs
-	if(length >= 2 && (enum pkt_type)buffer[0] == STATUS && for_us(channel,buffer+1,length-1,Ssrc) >= 0 ){
-	  // Process only if it's a response to our SSRC
-	  memcpy(&Metadata_source_address,&source_address,sizeof(Metadata_source_address));
-	  screen_update_needed = true;
+      // Message from the radio program (or some transcoders)
+      struct sockaddr_storage source_address;
+      socklen_t ssize = sizeof(source_address);
+      length = recvfrom(Status_fd,buffer,sizeof(buffer),0,(struct sockaddr *)&source_address,&ssize); // should not block
+      // Ignore our own command packets and responses to other SSIDs
+      if(length < 2 || (enum pkt_type)buffer[0] != STATUS || !for_us(channel,buffer+1,length-1,Ssrc))
+	continue; // Can include a timeout
+
+      // Process only if it's a response to our SSRC
+      memcpy(&Metadata_source_address,&source_address,sizeof(Metadata_source_address));
+      screen_update_needed = true;
 #ifdef DEBUG_POLL 
-	  wprintw(Debug_win,"got response length %d\n",length);
+      wprintw(Debug_win,"got response length %d\n",length);
 #endif
-	  decode_radio_status(channel,buffer+1,length-1);
-	  // Postpone next poll to specified interval
-	  next_radio_poll = now + radio_poll_interval + arc4random_uniform(random_interval) - random_interval/2;
-	  if(Blocktime == 0 && Frontend.samprate != 0)
-	    Blocktime = 1000.0f * Frontend.L / Frontend.samprate; // Set the firat time
-	}      
-      }
+      decode_radio_status(channel,buffer+1,length-1);
+      // Postpone next poll to specified interval
+      next_radio_poll = now + radio_poll_interval + arc4random_uniform(random_interval) - random_interval/2;
+      if(Blocktime == 0 && Frontend.samprate != 0)
+	Blocktime = 1000.0f * Frontend.L / Frontend.samprate; // Set the firat time
     } while(now < start_of_recv_poll + recv_timeout);
     // Set up command buffer in case we want to change something
     uint8_t cmdbuffer[PKTSIZE];
@@ -628,7 +614,7 @@ int main(int argc,char *argv[]){
       wprintw(Debug_win,"sent command len %d\n",command_len);
       screen_update_needed = true; // show local change right away
 #endif
-      if(send(Ctl_fd, cmdbuffer, command_len, 0) != command_len){
+      if(sendto(Output_fd, cmdbuffer, command_len, 0, (struct sockaddr *)&Metadata_dest_address,sizeof(struct sockaddr)) != command_len){
 	wprintw(Debug_win,"command send error: %s\n",strerror(errno));
 	screen_update_needed = true; // show local change right away
       }	
@@ -880,6 +866,15 @@ static int process_keyboard(struct channel *channel,uint8_t **bpp,int c){
       }
     }
     break;
+  case 'u':
+    {
+      char str[Entry_width],*ptr;
+      getentry("Data channel status rate ",str,sizeof(str));
+      int const b = strtol(str,&ptr,0);
+      if(ptr != str && b >= 0)
+	encode_int(bpp,STATUS_RATE,b);
+    }
+    break;
   default:
     beep();
     break;
@@ -999,13 +994,11 @@ static int init_demod(struct channel *channel){
   channel->fm.pdeviation = channel->linear.cphase = channel->linear.lock_timer = NAN;
   channel->output.gain = NAN;
   channel->tp1 = channel->tp2 = NAN;
-
-  channel->output.data_fd = channel->output.rtcp_fd = -1;
   return 0;
 }
 
-// Is response for us (1), or for somebody else (-1)?
-static int for_us(struct channel *channel,uint8_t const *buffer,int length,uint32_t ssrc){
+// Is response for us?
+static bool for_us(struct channel *channel,uint8_t const *buffer,int length,uint32_t ssrc){
   uint8_t const *cp = buffer;
   
   while(cp - buffer < length){
@@ -1034,8 +1027,8 @@ static int for_us(struct channel *channel,uint8_t const *buffer,int length,uint3
     case OUTPUT_SSRC: // If we've specified a SSRC, it must match it
       if(ssrc != 0){
 	if(decode_int32(cp,optlen) == ssrc)
-	  return 1; // For us
-	return -1; // For someone else
+	  return true; // For us
+	return false; // For someone else
       }
       break;
     default:
@@ -1044,12 +1037,12 @@ static int for_us(struct channel *channel,uint8_t const *buffer,int length,uint3
     cp += optlen;
   }
  done:;
-  return -1; // not specified, so not for us
+  return false; // not specified, so not for us
 }
 
 // Decode incoming status message from the radio program, convert and fill in fields in local channel structure
 // Leave all other fields unchanged, as they may have local uses (e.g., file descriptors)
-// Note that we use some fields in channel differently than in the radio (e.g., dB vs ratios)
+// Note that we use some fields in channel differently than in radiod (e.g., dB vs ratios)
 static int decode_radio_status(struct channel *channel,uint8_t const *buffer,int length){
   uint8_t const *cp = buffer;
   while(cp - buffer < length){
@@ -1112,7 +1105,7 @@ static int decode_radio_status(struct channel *channel,uint8_t const *buffer,int
       channel->output.rtp.packets = decode_int64(cp,optlen);
       break;
     case OUTPUT_METADATA_PACKETS:
-      Metadata_packets = decode_int64(cp,optlen);      
+      channel->metadata_packets = decode_int64(cp,optlen);
       break;
     case FILTER_BLOCKSIZE:
       Frontend.L = decode_int(cp,optlen);
@@ -1133,7 +1126,7 @@ static int decode_radio_status(struct channel *channel,uint8_t const *buffer,int
       Frontend.max_IF = decode_float(cp,optlen);
       break;
     case FE_ISREAL:
-      Frontend.isreal = decode_int8(cp,optlen) ? true: false;
+      Frontend.isreal = decode_bool(cp,optlen);
       break;
     case AD_BITS_PER_SAMPLE:
       Frontend.bitspersample = decode_int(cp,optlen);
@@ -1172,19 +1165,19 @@ static int decode_radio_status(struct channel *channel,uint8_t const *buffer,int
       channel->fm.pdeviation = decode_float(cp,optlen);
       break;
     case PLL_LOCK:
-      channel->linear.pll_lock = decode_int8(cp,optlen);
+      channel->linear.pll_lock = decode_bool(cp,optlen);
       break;
     case PLL_BW:
       channel->linear.loop_bw = decode_float(cp,optlen);
       break;
     case PLL_SQUARE:
-      channel->linear.square = decode_int8(cp,optlen);
+      channel->linear.square = decode_bool(cp,optlen);
       break;
     case PLL_PHASE:
       channel->linear.cphase = decode_float(cp,optlen);
       break;
     case ENVELOPE:
-      channel->linear.env = decode_int8(cp,optlen);
+      channel->linear.env = decode_bool(cp,optlen);
       break;
     case OUTPUT_LEVEL:
       channel->output.energy = dB2power(decode_float(cp,optlen));
@@ -1220,19 +1213,19 @@ static int decode_radio_status(struct channel *channel,uint8_t const *buffer,int
       channel->output.channels = decode_int(cp,optlen);
       break;
     case INDEPENDENT_SIDEBAND:
-      channel->filter.isb = decode_int8(cp,optlen);
+      channel->filter.isb = decode_bool(cp,optlen);
       break;
     case THRESH_EXTEND:
-      channel->fm.threshold = decode_int8(cp,optlen);
+      channel->fm.threshold = decode_bool(cp,optlen);
       break;
     case PLL_ENABLE:
-      channel->linear.pll = decode_int8(cp,optlen);
+      channel->linear.pll = decode_bool(cp,optlen);
       break;
     case GAIN:              // dB to voltage
       channel->output.gain = dB2voltage(decode_float(cp,optlen));
       break;
     case AGC_ENABLE:
-      channel->linear.agc = decode_int8(cp,optlen);
+      channel->linear.agc = decode_bool(cp,optlen);
       break;
     case HEADROOM:          // db to voltage
       channel->output.headroom = dB2voltage(decode_float(cp,optlen));
@@ -1296,6 +1289,9 @@ static int decode_radio_status(struct channel *channel,uint8_t const *buffer,int
       break;
     case RTP_PT:
       channel->output.rtp.type = decode_int(cp,optlen);
+      break;
+    case STATUS_RATE:
+      channel->status_rate = decode_int(cp,optlen);
       break;
     default: // ignore others
       break;
@@ -1575,7 +1571,8 @@ static void display_output(WINDOW *w,struct channel const *channel){
   pprintw(w,row++,col,"","%s->%s",formatsock(&Metadata_source_address),
 	   formatsock(&Metadata_dest_address));
   pprintw(w,row++,col,"Update interval","%'.2f sec",Refresh_rate);
-  pprintw(w,row++,col,"Status pkts","%'llu",Metadata_packets);
+  pprintw(w,row++,col,"Status on data channel","%u",channel->status_rate);
+  pprintw(w,row++,col,"Status pkts","%'llu",channel->metadata_packets);
   pprintw(w,row++,col,"Control pkts","%'llu",channel->commands);
   pprintw(w,row++,col,"Blocks since last poll","%'llu",channel->blocks_since_poll);
 
@@ -1731,5 +1728,21 @@ static int pprintw(WINDOW *w,int y, int x, char const *label, char const *fmt,..
   wclrtoeol(w);
   mvwaddstr(w,y,x+vstart,result);
   mvwaddstr(w,y,x,label);
+  return 0;
+}
+// Send empty poll command on specified descriptor
+static int send_poll(int ssrc){
+  uint8_t cmdbuffer[PKTSIZE];
+  uint8_t *bp = cmdbuffer;
+  *bp++ = 1; // Command
+
+  uint32_t tag = random();
+  encode_int(&bp,COMMAND_TAG,tag);
+  encode_int(&bp,OUTPUT_SSRC,ssrc); // poll specific SSRC, or request ssrc list with ssrc = 0
+  encode_eol(&bp);
+  int const command_len = bp - cmdbuffer;
+  if(sendto(Output_fd, cmdbuffer, command_len, 0, (struct sockaddr *)&Metadata_dest_address,sizeof(struct sockaddr)) != command_len)
+    return -1;
+
   return 0;
 }
