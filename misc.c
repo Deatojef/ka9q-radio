@@ -204,7 +204,6 @@ char *ftime(char * result,int size,int64_t t){
   else
     r = snprintf(cp,size,"    ");
     
-  assert(r == 4);
   if(r < 0)
     return NULL;
   cp += r;
@@ -485,7 +484,12 @@ void *mirror_alloc(size_t size){
   int fd;
 
 #if __linux__  
-  fd = memfd_create("mirror_alloc",0);
+  int flags = 0;
+  // New flag? Not documented on man page but mentioned in kernel warning message, so pass it if defined
+#ifdef MFD_NOEXEC_SEAL
+  flags |= MFD_NOEXEC_SEAL; // not executable and sealed to prevent changing to executable.
+#endif
+  fd = memfd_create("mirror_alloc",flags);
   if(fd < 0){
     perror("mirror_alloc memfd_create");
     munmap(base,size * 2);

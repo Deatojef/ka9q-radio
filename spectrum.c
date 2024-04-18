@@ -1,5 +1,5 @@
 // Spectral analysis service - far from complete - for ka9q-radio's radiod
-// Copyright 2023, Phil Karn, KA9Q
+// Copyright 2023-2024, Phil Karn, KA9Q
 #define _GNU_SOURCE 1
 #include <assert.h>
 #include <pthread.h>
@@ -20,12 +20,16 @@ void *demod_spectrum(void *arg){
   
   {
     char name[100];
-    snprintf(name,sizeof(name),"spect %u",chan->output.rtp.ssrc); // SSRC is dummy for ID, there's no RTP stream
+    snprintf(name,sizeof(name),"spect %u",chan->output.rtp.ssrc);
     pthread_setname(name);
   }
-
-  if(chan->filter.out)
-    delete_filter_output(&chan->filter.out);
+  pthread_mutex_init(&chan->status.lock,NULL);
+  pthread_mutex_lock(&chan->status.lock);
+  FREE(chan->status.command);
+  FREE(chan->filter.energies);
+  FREE(chan->spectrum.bin_data);
+  delete_filter_output(&chan->filter.out);
+  pthread_mutex_unlock(&chan->status.lock);
 
   if(chan->spectrum.bin_count <= 0)
     chan->spectrum.bin_count = 64; // Force a reasonable number of bins
@@ -54,11 +58,7 @@ void *demod_spectrum(void *arg){
   // points directly, so we decrease to correct for the overlap factor
   // I know all this can be simplified
   int const olen = fft_bins * (float)Frontend.L / N;
-  chan->filter.out = create_filter_output(Frontend.in,NULL,olen,SPECTRUM);
-  if(chan->filter.out == NULL){
-    fprintf(stdout,"unable to create filter for ssrc %lu\n",(unsigned long)chan->output.rtp.ssrc);
-    goto quit;
-  }
+  create_filter_output(&chan->filter.out,&Frontend.in,NULL,olen,SPECTRUM);
 
   // If it's already allocated (why should it be?) we don't know how big it is
   if(chan->spectrum.bin_data != NULL)
@@ -68,25 +68,17 @@ void *demod_spectrum(void *arg){
   set_freq(chan,chan->tune.freq); // retune front end if needed to cover requested bandwidth
 
   // Still need to clean up code to force radio freq to be multiple of FFT bin spacing
-  pthread_mutex_lock(&chan->lock);
-  while(!chan->terminate){
-    if(downconvert(chan) == -1)
-      break; // received terminate
-
+  while(downconvert(chan) == 0){
     int binp = 0; 
     for(int i=0; i < chan->spectrum.bin_count; i++){ // For each noncoherent integration bin above center freq
       float p = 0;
       for(int j=0; j < binsperbin; j++){ // Add energy of each fft bin that's part of this user integration bin
-	p += cnrmf(chan->filter.out->fdomain[binp++]);
+	p += cnrmf(chan->filter.out.fdomain[binp++]);
       }
       // Accumulate energy until next poll
       chan->spectrum.bin_data[i] += p;
     }
   }
- quit:;
-  pthread_mutex_unlock(&chan->lock);
-  FREE(chan->spectrum.bin_data);
-  FREE(chan->filter.energies);
   delete_filter_output(&chan->filter.out);
   return NULL;
 }
