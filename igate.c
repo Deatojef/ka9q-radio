@@ -47,6 +47,7 @@ typedef struct {
     APRS_COEF rx;
     APRS_COEF drp;
     APRS_COEF rxsat;
+    APRS_COEF rxdirect;
 } APRS_EQNS;
 
 typedef struct {
@@ -91,6 +92,7 @@ char *Overlay = "R";
 int dropped_pkts = 0;
 int received_pkts = 0;
 int received_sat_pkts = 0;
+int heard_direct_pkts = 0;
 
 // Starting APRS telemetry sequence number.  According to APRS this should increment by 1 for each batch of telemetry data sent.
 int sequence = 0;
@@ -249,6 +251,11 @@ int main(int argc,char *argv[])
                 exit(EX_OK);
             default:
                 fprintf(stderr,"Usage: %s -u user [-p passcode] [-v] [-I mcast_address][-h host] [-L latitude] [-G longitude] [-A altitude] [-C comment string] [-S symbol char] [-O overlay char] [-B 0|1] [-T telemetry sequence filename] [-H gpsd hostname] [-M 0|1]\n",argv[0]);
+
+                for (int k = 0; k < argc; k++) {
+                    fprintf(stderr, "argv[%d]: %s\n", k, argv[k]);
+                }
+
                 exit(EX_USAGE);
         }
     }
@@ -542,11 +549,15 @@ int main(int argc,char *argv[])
                 continue;
             }
 
+
             // Construct TNC2-style monitor string for APRS reporting
             char monstring[2048]; // Should be large enough for any legal AX.25 frame; we'll assert this periodically
             int sspace = sizeof(monstring);
             int infolen = 0;
-            int is_tcpip = 0;
+            int is_satellite = 0;
+            int used_digis = 0; // number of addresses that have their h-bit set
+            int heard_direct = 1; // assume by default that we're the first station to hear this packet
+            int is_rfonly = 0;
 
 
             // ------------------- start:  process the incoming packet ---------------
@@ -559,15 +570,36 @@ int main(int argc,char *argv[])
                     sspace -= w;
                     assert(sspace > 0);
                 }
+
+                // loop through each digipeater address checking for TCPIP and satellite packets heard directly
                 for(int i=0; i<frame.ndigi; i++) {
-                    // if "TCPIP" appears, this frame came off the Internet and should not be sent back to it
-                    if(strcmp(frame.digipeaters[i].name,"TCPIP") == 0)
-                        is_tcpip = 1;
+
+                    // if TCPIP, RFONLY, or NOGATE appears, this frame should not be igated
+                    if (strcmp(frame.digipeaters[i].name,"TCPIP") == 0 || strcmp(frame.digipeaters[i].name, "RFONLY") == 0 || strcmp(frame.digipeaters[i].name, "NOGATE") == 0)
+                        is_rfonly = 1;
+                    else if (strcmp(frame.digipeaters[i].name, "ARISS") == 0) 
+                        is_satellite = 1;
+                    
                     int const w = snprintf(cp,sspace,",%s%s",frame.digipeaters[i].name,frame.digipeaters[i].h ? "*" : "");
+
+                    // sum up the number of used digipeaters
+                    used_digis += frame.digipeaters[i].h;
+
                     cp += w;
                     sspace -= w;
                     assert(sspace > 0);
                 }
+
+                // if the number of digipeaters with their h-bit set is > 0, then we obviously haven't heard this packet directly (i.e. we're hearing it after it was digipeated).
+                if (used_digis)
+                    heard_direct = 0;
+
+                // print out if we heard this station directly or not
+                if(Logfile) {
+                    fprintf(Logfile, " direct %d", heard_direct);
+                }
+
+
                 {
                     // qAR means a bidirectional i-gate, qAO means receive-only
                     //    w = snprintf(cp,sspace,",qAR,%s",User);
@@ -601,6 +633,24 @@ int main(int argc,char *argv[])
             if(Logfile)
                 fprintf(Logfile," %s\n",monstring);
 
+            // ------------------ start:  stats ------------------------------
+            
+            // if heard directly, then update that counter
+            if (heard_direct) {
+                pthread_mutex_lock(&stats_lock);
+                heard_direct_pkts++;
+                pthread_mutex_unlock(&stats_lock);
+            }
+
+            pthread_mutex_lock(&stats_lock);
+            received_pkts++;
+            if (rtp_header.ssrc == 145825)
+                received_sat_pkts++;
+            pthread_mutex_unlock(&stats_lock);
+
+            // ------------------ end:  stats ------------------------------
+            
+
             // ------------------- start:  check for drop conditions ---------------
             if(frame.control != 0x03 || frame.type != 0xf0) {
                 if(Logfile)
@@ -622,9 +672,9 @@ int main(int argc,char *argv[])
 
                 continue;
             }
-            if(is_tcpip) {
+            if(is_rfonly) {
                 if(Logfile)
-                    fprintf(Logfile," Not relaying: Internet relayed packet\n");
+                    fprintf(Logfile," Not relaying: RF only or TCPIP packet\n");
 
                 pthread_mutex_lock(&stats_lock);
                 dropped_pkts++;
@@ -642,13 +692,14 @@ int main(int argc,char *argv[])
 
                 continue;
             }
+            if (is_satellite && heard_direct) {
+                if(Logfile)
+                    fprintf(Logfile," Not relaying: satellite packet heard directly\n");
+                continue;
+            }
+
             // ------------------- end:  check for drop conditions ---------------
 
-            pthread_mutex_lock(&stats_lock);
-            received_pkts++;
-            if (rtp_header.ssrc == 145825)
-                received_sat_pkts++;
-            pthread_mutex_unlock(&stats_lock);
 
             int ret;
 
@@ -853,9 +904,11 @@ int telemetrypacket(char *buffer, size_t n, APRS_EQNS *eqns)
     int received;
     int dropped;
     int received_sat;
+    int heard_direct;
     int adjusted_receive;
     int adjusted_dropped;
     int adjusted_receive_sat;
+    int adjusted_direct;
 
     // sanity check
     if (buffer == NULL)
@@ -868,10 +921,11 @@ int telemetrypacket(char *buffer, size_t n, APRS_EQNS *eqns)
     received = received_pkts;
     dropped = dropped_pkts;
     received_sat = received_sat_pkts;
+    heard_direct = heard_direct_pkts;
     received_pkts = 0;
     dropped_pkts = 0;
     received_sat_pkts = 0;
-
+    heard_direct_pkts = 0;
 
     // unlock the stats mutex
     pthread_mutex_unlock(&stats_lock);
@@ -880,9 +934,10 @@ int telemetrypacket(char *buffer, size_t n, APRS_EQNS *eqns)
     adjusted_receive = calculatecoef(received, &(eqns->rx));
     adjusted_dropped = calculatecoef(dropped, &(eqns->drp));
     adjusted_receive_sat = calculatecoef(received_sat, &(eqns->rxsat));
+    adjusted_direct = calculatecoef(heard_direct, &(eqns->rxdirect));
 
     // write the telemetry packet string to the supplied buffer.
-    num = snprintf(buffer, n, "%s>%s,TCPIP*:T#%03d,%03d,%03d,%03d,%03d,%03d,00000000,Telemetry report", User, tocall, sequence, adjusted_receive, adjusted_dropped, adjusted_receive_sat, 0, 0);
+    num = snprintf(buffer, n, "%s>%s,TCPIP*:T#%03d,%03d,%03d,%03d,%03d,%03d,00000000,Telemetry report", User, tocall, sequence, adjusted_receive, adjusted_dropped, adjusted_receive_sat, adjusted_direct, 0);
 
     // check the sequence number.  If > 999, then we roll it back to 000.
     sequence++;
@@ -1030,8 +1085,13 @@ int eqnpacket(char *buffer, size_t n, APRS_EQNS *eqns)
     if (buffer == NULL)
         return 0;
 
-    return snprintf(buffer, n, "%s>%s,TCPIP*::%-9s:EQNS.%d,%d,%d,%d,%d,%d,%d,%d,%d,0,0,0,0,0,0", 
-            User, tocall, User, eqns->rx.a, eqns->rx.b, eqns->rx.c, eqns->drp.a, eqns->drp.b, eqns->drp.c, eqns->rxsat.a, eqns->rxsat.b, eqns->rxsat.c);
+    return snprintf(buffer, n, "%s>%s,TCPIP*::%-9s:EQNS.%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,0,0,0", 
+            User, tocall, User, 
+            eqns->rx.a, eqns->rx.b, eqns->rx.c, 
+            eqns->drp.a, eqns->drp.b, eqns->drp.c, 
+            eqns->rxsat.a, eqns->rxsat.b, eqns->rxsat.c, 
+            eqns->rxdirect.a, eqns->rxdirect.b, eqns->rxdirect.c 
+            );
 
 }
 
@@ -1043,7 +1103,7 @@ int parampacket(char *buffer, size_t n)
     if (buffer == NULL)
         return 0;
 
-    return snprintf(buffer, n, "%s>%s,TCPIP*::%-9s:PARM.Rx10m,Drop10m,RxSat10m", User, tocall, User);
+    return snprintf(buffer, n, "%s>%s,TCPIP*::%-9s:PARM.Rx10m,Drop10m,RxSat10m,RxDirect10m", User, tocall, User);
 
 }
 
@@ -1055,7 +1115,7 @@ int unitspacket(char *buffer, size_t n)
     if (buffer == NULL)
         return 0;
 
-    return snprintf(buffer, n, "%s>%s,TCPIP*::%-9s:UNIT.Pkts,Pkts,Pkts", User, tocall, User);
+    return snprintf(buffer, n, "%s>%s,TCPIP*::%-9s:UNIT.Pkts,Pkts,Pkts,Pkts", User, tocall, User);
 
 }
 
