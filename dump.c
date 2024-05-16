@@ -18,7 +18,7 @@ void dump_metadata(FILE *fp,uint8_t const * const buffer,int length,bool newline
 
   while(cp - buffer < length){
     enum status_type const type = *cp++; // increment cp to length field
-    
+
     if(type == EOL)
       break; // End of list
 
@@ -70,7 +70,7 @@ void dump_metadata(FILE *fp,uint8_t const * const buffer,int length,bool newline
     case OUTPUT_DATA_SOURCE_SOCKET:
       {
 	struct sockaddr_storage sock;
-	fprintf(fp,"data src %s",formatsock(decode_socket(&sock,cp,optlen))); 
+	fprintf(fp,"data src %s",formatsock(decode_socket(&sock,cp,optlen)));
       }
       break;
     case OUTPUT_DATA_DEST_SOCKET:
@@ -158,7 +158,7 @@ void dump_metadata(FILE *fp,uint8_t const * const buffer,int length,bool newline
       fprintf(fp,"fe produces %s samples",decode_int8(cp,optlen) ? "real" : "complex");
       break;
     case KAISER_BETA:
-      fprintf(fp,"filter kaiser_beta %g",decode_float(cp,optlen));      
+      fprintf(fp,"filter kaiser_beta %g",decode_float(cp,optlen));
       break;
     case FILTER_BLOCKSIZE:
       fprintf(fp,"filter L %'d",decode_int(cp,optlen));
@@ -334,6 +334,12 @@ void dump_metadata(FILE *fp,uint8_t const * const buffer,int length,bool newline
       break;
     case STATUS_INTERVAL:
       fprintf(fp,"status interval %d",decode_int(cp,optlen));
+      break;
+    case OUTPUT_ENCODING:
+      {
+	int e = decode_int(cp,optlen);
+	fprintf(fp,"encoding %d (%s)",e,encoding_string(e));
+      }
       break;
     default:
       fprintf(fp,"unknown type %d length %d",type,optlen);

@@ -166,7 +166,7 @@ int main(int argc,char *argv[]){
   while((c = getopt(argc,argv,"N:hvp:IV")) != -1){
     switch(c){
     case 'V': // Already shown above
-      exit(EX_OK); 
+      exit(EX_OK);
     case 'p':
       FFTW_plan_timelimit = strtod(optarg,NULL);
       break;
@@ -186,17 +186,17 @@ int main(int argc,char *argv[]){
       exit(EX_USAGE);
     }
   }
-  
+
   // Graceful signal catch
   signal(SIGPIPE,closedown);
   signal(SIGINT,closedown);
   signal(SIGKILL,closedown);
   signal(SIGQUIT,closedown);
-  signal(SIGTERM,closedown);        
+  signal(SIGTERM,closedown);
   signal(SIGPIPE,SIG_IGN);
   signal(SIGUSR1,verbosity);
   signal(SIGUSR2,verbosity);
-  
+
   if(argc <= optind){
     fprintf(stdout,"Configtable file missing\n");
     exit(EX_NOINPUT);
@@ -287,10 +287,10 @@ static int loadconfig(char const * const file){
     char const *p = config_getstring(Configtable,global,"iface",Iface);
     if(p != NULL){
       Iface = strdup(p);
-      Default_mcast_iface = Iface;    
+      Default_mcast_iface = Iface;
     }
   }
-  // Overrides in [global] of compiled-in defaults 
+  // Overrides in [global] of compiled-in defaults
   {
     char data_default[256];
     snprintf(data_default,sizeof(data_default),"%s-pcm",Name);
@@ -365,7 +365,7 @@ static int loadconfig(char const * const file){
       if(strcasecmp(sname,hardware) == 0){
 	if(setup_hardware(sname) != 0)
 	  exit(EX_NOINPUT);
-	
+
 	break;
       }
     }
@@ -441,16 +441,15 @@ static int loadconfig(char const * const file){
     // Override [global] settings with section settings
     char const *data = config_getstring(Configtable,sname,"data",Data);
     // Override global defaults
-    int const mcast_ttl = config_getint(Configtable,sname,"ttl",Mcast_ttl);
     int const ip_tos = config_getint(Configtable,sname,"tos",IP_tos);
     char const *iface = config_getstring(Configtable,sname,"iface",Iface);
     int const update = config_getint(Configtable,sname,"update",Update);
-    
+
     // data stream is shared by all channels in this section
     // Now also used for per-channel status/control, with different port number
     struct sockaddr_storage data_dest_socket;
     struct sockaddr_storage metadata_dest_socket;
-    
+
     // There can be multiple senders to an output stream, so let avahi suppress the duplicate addresses
     {
       char ttlmsg[100];
@@ -470,7 +469,7 @@ static int loadconfig(char const * const file){
       }
 #endif
     }
-    join_group(Output_fd,(struct sockaddr *)&data_dest_socket,iface,mcast_ttl,ip_tos);
+    join_group(Output_fd,(struct sockaddr *)&data_dest_socket,iface,Mcast_ttl,ip_tos);
     // No need to also join group for status socket, since the IP addresses are the same
 
     // Process frequency/frequencies
@@ -496,7 +495,7 @@ static int loadconfig(char const * const file){
       for(char const *tok = strtok_r(freq_list," \t",&saveptr);
 	  tok != NULL;
 	  tok = strtok_r(NULL," \t",&saveptr)){
-	
+
 	double const f = parse_frequency(tok,true);
 	if(f < 0){
 	  fprintf(stdout,"can't parse frequency %s\n",tok);
@@ -532,25 +531,17 @@ static int loadconfig(char const * const file){
 	set_defaults(chan);
 	if(preset != NULL && loadpreset(chan,Preset_table,preset) != 0)
 	  fprintf(stdout,"warning: in [%s], loadpreset(%s,%s) failed; compiled-in defaults and local settings used\n",sname,Preset_file,preset);
-	
+
 	strlcpy(chan->preset,preset,sizeof(chan->preset));
 	loadpreset(chan,Configtable,sname); // Overwrite with other entries from this section, without overwriting those
-	
+
 	// Set up output stream (data + status)
 	// Data multicast group has already been joined
 	memcpy(&chan->output.dest_socket,&data_dest_socket,sizeof(chan->output.dest_socket));
 	strlcpy(chan->output.dest_string,data,sizeof(chan->output.dest_string));
 	memcpy(&chan->status.dest_socket,&metadata_dest_socket,sizeof(chan->status.dest_socket));
 
-	// Set RTP payload type from static table specific to ka9q-radio
-	// Should assign dynamically, but requires completion of SDP 
-	int const type = pt_from_info(chan->output.samprate,chan->output.channels);
-	if(type < 0){
-	  fprintf(stdout,"can't allocate RTP payload type for samprate %'d, channels %d\n",chan->output.samprate,chan->output.channels);
-	  close_chan(chan); // OK to call here outside demod, since it's not running yet
-	  continue;
-	}
-	chan->output.rtp.type = type;
+	chan->output.rtp.type = pt_from_info(chan->output.samprate,chan->output.channels);
 	chan->status.output_interval = update;
 
 	// Time to start it -- ssrc is stashed by create_chan()
@@ -558,12 +549,12 @@ static int loadconfig(char const * const file){
 	start_demod(chan);
 	nfreq++;
 	nchans++;
-	
+
 	if(SAP_enable){
 	  // Highly experimental, off by default
 	  char sap_dest[] = "224.2.127.254:9875"; // sap.mcast.net
 	  resolve_mcast(sap_dest,&chan->sap.dest_socket,0,NULL,0);
-	  join_group(Output_fd,(struct sockaddr *)&chan->sap.dest_socket,iface,mcast_ttl,ip_tos);
+	  join_group(Output_fd,(struct sockaddr *)&chan->sap.dest_socket,iface,Mcast_ttl,ip_tos);
 	  pthread_create(&chan->sap.thread,NULL,sap_send,chan);
 	}
 	// RTCP Real Time Control Protocol daemon is optional
@@ -649,7 +640,7 @@ static int setup_hardware(char const *sname){
     return -1;
   }
 
-  int r = (*Frontend.setup)(&Frontend,Configtable,sname); 
+  int r = (*Frontend.setup)(&Frontend,Configtable,sname);
   if(r != 0){
     fprintf(stdout,"device setup returned %d\n",r);
     return r;
@@ -675,7 +666,7 @@ static int setup_hardware(char const *sname){
   pthread_mutex_init(&Frontend.status_mutex,NULL);
   pthread_cond_init(&Frontend.status_cond,NULL);
   if(Frontend.start){
-    int r = (*Frontend.start)(&Frontend); 
+    int r = (*Frontend.start)(&Frontend);
     if(r != 0)
       fprintf(stdout,"Front end start returned %d\n",r);
 
@@ -705,7 +696,7 @@ static void *rtcp_send(void *arg){
       goto done;
     uint8_t buffer[PKTSIZE]; // much larger than necessary
     memset(buffer,0,sizeof(buffer));
-    
+
     // Construct sender report
     struct rtcp_sr sr;
     memset(&sr,0,sizeof(sr));
@@ -722,12 +713,12 @@ static void *rtcp_send(void *arg){
     sr.rtp_timestamp = (0 + gps_time_ns() - Starttime) / BILLION;
     sr.packet_count = chan->output.rtp.seq;
     sr.byte_count = chan->output.rtp.bytes;
-    
+
     uint8_t *dp = gen_sr(buffer,sizeof(buffer),&sr,NULL,0);
 
     // Construct SDES
     struct rtcp_sdes sdes[4];
-    
+
     // CNAME
     char hostname[1024];
     gethostname(hostname,sizeof(hostname));
@@ -743,7 +734,7 @@ static void *rtcp_send(void *arg){
     sdes[1].type = NAME;
     strlcpy(sdes[1].message,"KA9Q Radio Program",sizeof(sdes[1].message));
     sdes[1].mlen = strlen(sdes[1].message);
-    
+
     sdes[2].type = EMAIL;
     strlcpy(sdes[2].message,"karn@ka9q.net",sizeof(sdes[2].message));
     sdes[2].mlen = strlen(sdes[2].message);
@@ -751,7 +742,7 @@ static void *rtcp_send(void *arg){
     sdes[3].type = TOOL;
     strlcpy(sdes[3].message,"KA9Q Radio Program",sizeof(sdes[3].message));
     sdes[3].mlen = strlen(sdes[3].message);
-    
+
     dp = gen_sdes(dp,sizeof(buffer) - (dp-buffer),chan->output.rtp.ssrc,sdes,4);
 
 
