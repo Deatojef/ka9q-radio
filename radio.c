@@ -90,17 +90,7 @@ struct channel *create_chan(uint32_t ssrc){
     chan->output.rtp.ssrc = ssrc; // Stash it
     Active_channel_count++;
   }
-  // Copy template
-  // Although there are some pointers in here (filter.out, filter.energies), they're all NULL until the chan actually starts
   chan->lifetime = 20 * 1000 / Blocktime; // If freq == 0, goes away 20 sec after last command
-
-  // Get the local socket for the output stream
-  // Going connectionless with Output_fd broke this. The source port is filled in, but the source address is all zeroes because
-  // it depends on the specific output address, which is only known from a routing table lookup. Oh well.
-  {
-    socklen_t len = sizeof(chan->output.source_socket);
-    getsockname(Output_fd,(struct sockaddr *)&chan->output.source_socket,&len);
-  }
 
   pthread_mutex_unlock(&Channel_list_mutex);
   return chan;
@@ -233,12 +223,6 @@ int start_demod(struct channel * chan){
 	    chan->output.rtp.ssrc, chan->output.dest_string, chan->demod_type, chan->tune.freq, chan->preset, chan->filter.min_IF, chan->filter.max_IF);
   }
   pthread_create(&chan->demod_thread,NULL,demod_thread,chan);
-
-  /* ????
-     case SPECT_DEMOD:
-     if(chan->tune.freq != 0)
-     pthread_create(&chan->demod_thread,NULL,demod_spectrum,chan); // spectrum chan can't change freq, so just don't start it at 0
-  */
   return 0;
 }
 
@@ -510,10 +494,11 @@ int downconvert(struct channel *chan){
     if(chan->tune.freq == 0 && chan->lifetime > 0){
       if(--chan->lifetime <= 0){
 	chan->demod_type = -1;  // No demodulator
+	if(Verbose > 1)
+	  fprintf(stdout,"chan %d terminate needed\n",chan->output.rtp.ssrc);
 	return -1; // terminate needed
       }
     }
-
     // Process any commands and return status
     bool restart_needed = false;
     pthread_mutex_lock(&chan->status.lock);
@@ -539,9 +524,11 @@ int downconvert(struct channel *chan){
       reset_radio_status(chan); // After both are sent
     }
     pthread_mutex_unlock(&chan->status.lock);
-    if(restart_needed)
+    if(restart_needed){
+      if(Verbose > 1)
+	fprintf(stdout,"chan %d restart needed\n",chan->output.rtp.ssrc);
       return +1; // Restart needed
-
+    }
     // To save CPU time when the front end is completely tuned away from us, block (with timeout) until the front
     // end status changes rather than process zeroes. We must still poll the terminate flag.
     pthread_mutex_lock(&Frontend.status_mutex);
@@ -555,13 +542,17 @@ int downconvert(struct channel *chan){
       pthread_mutex_unlock(&Frontend.status_mutex);
       break;
     }
-    // No front end coverage of our carrier; wait for it to retune
+    // No front end coverage of our carrier; wait one block time for it to retune
     chan->sig.bb_power = 0;
     chan->sig.bb_energy = 0;
     chan->output.energy = 0;
     struct timespec timeout; // Needed to avoid deadlock if no front end is available
     clock_gettime(CLOCK_REALTIME,&timeout);
-    timeout.tv_sec += 1; // 1 sec in the future
+    timeout.tv_nsec += Blocktime * MILLION; // milliseconds to nanoseconds
+    if(timeout.tv_nsec > BILLION){
+      timeout.tv_sec += 1; // 1 sec in the future
+      timeout.tv_nsec -= BILLION;
+    }
     pthread_cond_timedwait(&Frontend.status_cond,&Frontend.status_mutex,&timeout);
     pthread_mutex_unlock(&Frontend.status_mutex);
   }

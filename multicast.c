@@ -46,8 +46,8 @@ struct pt_table PT_table[128] = {
 { 0, 0, 0 }, // 7
 { 0, 0, 0 }, // 8
 { 0, 0, 0 }, // 9
-{ 48000, 2, S16BE }, // 10
-{ 48000, 1, S16BE }, // 11
+{ 44100, 2, S16BE }, // 10
+{ 44100, 1, S16BE }, // 11
 { 0, 0, 0 }, // 12
 { 0, 0, 0 }, // 13
 { 0, 0, 0 }, // 14
@@ -136,7 +136,7 @@ struct pt_table PT_table[128] = {
 { 0, 0, 0 }, // 97
 { 0, 0, 0 }, // 98
 { 0, 0, 0 }, // 99
-{ 0, 0, 0 }, // 100 
+{ 0, 0, 0 }, // 100
 { 0, 0, 0 }, // 101
 { 0, 0, 0 }, // 102
 { 0, 0, 0 }, // 103
@@ -148,15 +148,15 @@ struct pt_table PT_table[128] = {
 { 0, 0, 0 }, // 109
 { 0, 0, 0 }, // 110
 { 48000, 2, OPUS }, // 111  Opus always uses a 48K virtual sample rate
-{ 0, 0, 0 }, // 112
-{ 0, 0, 0 }, // 113
+{ 48000, 1, S16BE }, // 112
+{ 48000, 2, S16BE }, // 113
 { 0, 0, 0 }, // 114
 { 0, 0, 0 }, // 115
 { 24000, 1, S16BE }, // 116
-{ 24000, 2, S16BE }, // 117 
+{ 24000, 2, S16BE }, // 117
 { 0, 0, 0 }, // 118
 { 16000, 1, S16BE }, // 119
-{ 16000, 2, S16BE }, // 120 
+{ 16000, 2, S16BE }, // 120
 { 0, 0, 0 }, // 121
 { 12000, 1, S16BE }, // 122
 { 12000, 2, S16BE }, // 123
@@ -297,7 +297,7 @@ int listen_mcast(void const *s,char const *iface){
   if(fd == -1){
     perror("setup_mcast socket");
     return -1;
-  }      
+  }
   switch(sock->sa_family){
   case AF_INET:
     set_ipv4_options(fd,-1,-1);
@@ -357,26 +357,25 @@ int resolve_mcast(char const *target,void *sock,int default_port,char *iface,int
     snprintf(full_host,sizeof(full_host),"%s.local",host);
   else
     strlcpy(full_host,host,sizeof(full_host));
-    
+
   for(try=0;;try++){
     results = NULL;
     struct addrinfo hints;
     memset(&hints,0,sizeof(hints));
-#if 0
+#if 1
     // Using hints.ai_family = AF_UNSPEC generates both A and AAAA queries
     // but even when the A query is answered the library times out and retransmits the AAAA
     // query several times. So do only an A (IPv4) query the first time
     hints.ai_family = (try == 0) ? AF_INET : AF_UNSPEC;
 #else
-    // Doesn't seem to be a problem anymore, and using AF_INET often fails
-    // on loopback.
+    // using AF_INET often fails on loopback.
     // Did this get changed recently in getaddrinfo()?
     hints.ai_family = AF_UNSPEC;
 #endif
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_protocol = IPPROTO_UDP;
     hints.ai_flags = AI_ADDRCONFIG;
-    
+
     int const ecode = getaddrinfo(full_host,port,&hints,&results);
     if(ecode == 0)
       break;
@@ -551,7 +550,7 @@ char const *formatsock(void const *s){
       ic->prev->next = ic->next;
       if(ic->next)
 	ic->next->prev = ic->prev;
-      
+
       ic->next = Inverse_cache_table;
       ic->next->prev = ic;
       ic->prev = NULL;
@@ -564,7 +563,7 @@ char const *formatsock(void const *s){
   assert(ic != NULL); // Malloc failures are rare
   char host[NI_MAXHOST],port[NI_MAXSERV];
   memset(host,0,sizeof(host));
-  memset(port,0,sizeof(port));  
+  memset(port,0,sizeof(port));
   getnameinfo(sa,slen,
 	      host,NI_MAXHOST,
 	      port,NI_MAXSERV,
@@ -592,8 +591,17 @@ int channels_from_pt(int const type){
     return 0;
   return PT_table[type].channels;
 }
- 
-// Should dynamically create a new one if not found
+
+enum encoding encoding_from_pt(int const type){
+  if(type < 0 || type > 127)
+    return NO_ENCODING;
+  return PT_table[type].encoding;
+}
+
+
+// Dynamically create a new one if not found
+// Should lock the table when it's modified
+// Should add encoding to this parameter list
 int pt_from_info(int const samprate,int const channels){
   if(samprate <= 0 || channels <= 0 || channels > 2)
     return -1;
@@ -603,7 +611,7 @@ int pt_from_info(int const samprate,int const channels){
     if(PT_table[type].samprate == samprate && PT_table[type].channels == channels)
       return type;
 
-  for(int type=0; type < 128; type++){
+  for(int type=96; type < 128; type++){ // Dynamic range
     if(PT_table[type].samprate == 0){
       // allocate it
       PT_table[type].samprate = samprate;
@@ -637,7 +645,7 @@ int address_match(void const *arg1,void const *arg2){
       if(memcmp(&sinp1->sin6_addr,&sinp2->sin6_addr,sizeof(sinp1->sin6_addr)) == 0)
 	return 1;
     }
-    break;    
+    break;
   }
   return 0;
 }
@@ -792,7 +800,7 @@ static int ipv4_join_group(int const fd,void const * const sock,char const * con
   struct sockaddr_in const * const sin = (struct sockaddr_in *)sock;
   if(!IN_MULTICAST(ntohl(sin->sin_addr.s_addr)))
     return -1;
-  
+
   struct ip_mreqn mreqn;
   mreqn.imr_multiaddr = sin->sin_addr;
   mreqn.imr_address.s_addr = INADDR_ANY;
@@ -822,10 +830,10 @@ static int ipv6_join_group(int const fd,void const * const sock,char const * con
     ipv6_mreq.ipv6mr_interface = 0; // Default interface
   else
     ipv6_mreq.ipv6mr_interface = if_nametoindex(iface);
-  
+
   // Doesn't seem to be defined on Mac OSX, but is supposed to be synonymous with IPV6_JOIN_GROUP
 #ifndef IPV6_ADD_MEMBERSHIP
-#define IPV6_ADD_MEMBERSHIP IPV6_JOIN_GROUP      
+#define IPV6_ADD_MEMBERSHIP IPV6_JOIN_GROUP
 #endif
   if(setsockopt(fd,IPPROTO_IP,IPV6_ADD_MEMBERSHIP,&ipv6_mreq,sizeof(ipv6_mreq)) != 0 && errno != EADDRINUSE){
     perror("multicast v6 join");
@@ -869,7 +877,7 @@ static struct {
 #ifdef IFF_DORMANT
 	     {IFF_DORMANT,"DORMANT"},
 #endif
-#ifdef IFF_ECHO	     
+#ifdef IFF_ECHO
 	     {IFF_ECHO,"ECHO"},
 #endif
 	     {0, NULL},
@@ -879,10 +887,10 @@ static struct {
 // Dump list of interfaces
 void dump_interfaces(void){
   struct ifaddrs *ifap = NULL;
-  
+
   getifaddrs(&ifap);
   fprintf(stdout,"Interface list:\n");
-  
+
   for(struct ifaddrs const *i = ifap; i != NULL; i = i->ifa_next){
     int const family = i->ifa_addr->sa_family;
 
@@ -916,7 +924,7 @@ void dump_interfaces(void){
     fprintf(stdout,"%s %s(%d)",i->ifa_name,familyname,family);
 
     char host[NI_MAXHOST];
-    
+
     if(i->ifa_addr && getnameinfo(i->ifa_addr,socksize,host,NI_MAXHOST,NULL,0,NI_NUMERICHOST) == 0)
       fprintf(stdout," addr %s",host);
     if(i->ifa_dstaddr && getnameinfo(i->ifa_dstaddr,socksize,host,NI_MAXHOST,NULL,0,NI_NUMERICHOST) == 0)
@@ -935,4 +943,21 @@ void dump_interfaces(void){
   fprintf(stdout,"end of list\n");
   freeifaddrs(ifap);
   ifap = NULL;
+}
+char const *encoding_string(enum encoding e){
+  switch(e){
+  default:
+  case NO_ENCODING:
+    return "none";
+  case S16LE:
+    return "signed 16-bit little endian";
+  case S16BE:
+    return "signed 16-bit big endian";    
+  case OPUS:
+    return "Opus";
+  case F32:
+    return "32 bit floating point";
+  case AX25:
+    return "AX.25";
+  }
 }

@@ -24,11 +24,13 @@ extern int Mcast_ttl;
 extern int IP_tos;
 
 enum encoding {
-  S16LE = 1,
+  NO_ENCODING = 0,
+  S16LE,
   S16BE,
   OPUS,
   F32,
   AX25,
+  UNUSED_ENCODING, // Sentinel, not used
 };
 
 struct pt_table {
@@ -211,6 +213,8 @@ static inline uint8_t *put32(uint8_t *dp,uint32_t x){
 }
 int samprate_from_pt(int type);
 int channels_from_pt(int type);
+enum encoding encoding_from_pt(int type);
 int pt_from_info(int samprate,int channels);
+char const *encoding_string(enum encoding);
 
 #endif
