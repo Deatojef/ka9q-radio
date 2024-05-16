@@ -29,6 +29,7 @@
 #include <sysexits.h>
 #include <poll.h>
 #include <gps.h>
+#include <cjson/cJSON.h>
 
 #include "multicast.h"
 #include "ax25.h"
@@ -56,10 +57,58 @@ typedef struct {
     double alt;
     double course;
     double speed;
+    int gpsmode; // By default, not using GPSD for location information
+} LOCATION;
+
+// APRS packet stats
+typedef struct {
+    int dropped;  // number of packets dropped (i.e. not sent to APRS-IS) for one reason or another
+    int received;  // number of received (over RF...err..technical from packetd) packets
+    int satellite;  // number of packets received from satellites (mostly on 145.825MHz)
+    int direct;  // number of packets we've heard direction (i.e. not digipeated)
+} PACKET_STATISTICS;
+
+// this igate configuration
+typedef struct {
+
+    // is this a fixed or mobile station
+    bool ismobile;  // default to a fixed station
+                            
+    // GPSD hostname
+    char gpsdhost[128];
+    bool gpsdenabled;
+
+    // AX25 multicast hostname
+    char ax25host[128];
+
+    // APRS-IS hostname and port
+    char aprsishost[128];
+    char aprsisport[16];
+    bool aprsisbeaconing;
+
+    // The name of the telementry sequence filename
+    char telemseqfilename[128];
+    int sequence;
+
+    // the name of the log file
+    char logfilename[128]; 
+
+    // Ham callsign and passcode
+    char callsign[16];
+    char passcode[16];
+
     char symbol[3];  // character representing the symbol
     char overlay[3]; // character representing the char to be overlaid on top of the symbol
     char comment[186]; // max APRS information field length is 256 bytes. That minus normal position packet length (ex. 70 bytes), leaves 186 bytes for "everything else" like the station comment.
-} APRS_STATION;
+
+    // igate configuration file
+    char configfilename[128];
+
+    // file handles
+    FILE *logfile;  // log file
+    FILE *configfile;  // config file
+
+} IGATE_CONFIGURATION;
 
 // ---------------------------------------------------------------------
 
@@ -67,68 +116,35 @@ typedef struct {
 // global variables
 // ---------------------------------------------------------------------
 char *Mcast_address_text = "ax25.local";
-char *Host = "noam.aprs2.net";
-char *Port = "14580";
-char *User;
-char *Passcode;
+const char *App_path;
 char *Logfilename;
-char *Latitude;
-char *Longitude;
-char *Altitude;
-char *Comment;
-char *Mobile = "0";
-char *Beaconing = "0";
-char *TelemSeqFilename;
-char *GPSDHost = NULL;
+char *Configfilename = "/etc/radio/igate.json";
 
 // max packet size for position packets (actually the max size is 256 - 70 = 186, but backing this off by 8 bytes for a little buffer room)
 static int MAX_POSIT = 178;
 
-// By default, when beaconing to APRS-IS, we represent this station as an Rx-only Igate.
-char *Symbol = "&";
-char *Overlay = "R";
-
-// for keeping track of the number of received and dropped (because of bad stuff) packets
-int dropped_pkts = 0;
-int received_pkts = 0;
-int received_sat_pkts = 0;
-int heard_direct_pkts = 0;
-
-// Starting APRS telemetry sequence number.  According to APRS this should increment by 1 for each batch of telemetry data sent.
-int sequence = 0;
-
 // APRS tocall value.  Experimental tocalls start with APZxxx.  Using "KR1" for "KA9Q-Radio 1".  Dunno...just making this up.  ;)
 char *tocall = "APZKR1";
 
-// By default beaconing to APRS-IS is not enabled.
-bool beaconing_enabled = false;
 
-// By default, not using GPSD for location information
-bool gpsd_enabled = false;
-int gpsmode;
+// the configuration
+IGATE_CONFIGURATION igate_configuration;
 
-// station information
-APRS_STATION aprs_station;
+// statistics (this is protected by a mutex)
+PACKET_STATISTICS aprs_statistics;
 
-// logfile and application name
-FILE *Logfile;
-const char *App_path;
-
-// Telemetry sequence file handle
-FILE *telefile;
+// location data (this is protected by a mutex)
+LOCATION location;
 
 // Verbosity level
 int Verbose;
 
-// File descriptors
+// File descriptors for connecting to RTP streams.
 int Input_fd = -1;
 int Network_fd = -1;
 
 // The global variable that processing loops check.  If this is set to "true", then processing loops should end.
 bool stop_processing = false;
-
-// is this a statis or mobile station.  Static by default
-bool ismobile = false;
 // ---------------------------------------------------------------------
 
 
@@ -136,7 +152,7 @@ bool ismobile = false;
 // ---------------------------------------------------------------------
 pthread_mutex_t tcp_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t beacon_lock = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t aprs_station_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t location_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t cleartoxmit = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -158,11 +174,15 @@ int parampacket(char *buffer, size_t n);
 int eqnpacket(char *buffer, size_t n, APRS_EQNS *eqns);
 int calculatecoef(int value, APRS_COEF *c);
 int telemetrypacket(char *buffer, size_t n, APRS_EQNS *eqns);
-int createinfostring(char *buffer, size_t n, APRS_STATION *station);
-void initstation(APRS_STATION *station);
+int createinfostring(char *buffer, size_t n, LOCATION *station);
 void closedown(int x);
 int readtelemseq(char *filename);
 void writetelemseq(char *filename, int seq);
+void processJSONObject(cJSON *json);
+void checkForConfigurable(cJSON *item);
+void initlocation(LOCATION *loc);
+void initpacketstatistics(PACKET_STATISTICS *stats);
+void initigateconfig(IGATE_CONFIGURATION *config);
 // --------------------------------------------------------------------
 
 
@@ -176,6 +196,7 @@ int main(int argc,char *argv[])
     char timebuffer[1024];
 
     App_path = argv[0];
+
     // Quickly drop root if we have it
     // The sooner we do this, the fewer options there are for abuse
     if(seteuid(getuid()) != 0)
@@ -194,99 +215,105 @@ int main(int argc,char *argv[])
 
     // Parse through command line arguments
     int c;
-    while((c = getopt(argc,argv,"u:p:I:vh:f:L:G:A:S:O:C:V:B:T:H:M:")) != EOF) {
+    while((c = getopt(argc,argv,"vVf:c:")) != EOF) {
         switch(c) {
             case 'f':
                 Logfilename = optarg;
                 Verbose = 0;
                 break;
-            case 'u':
-                User = optarg;
+            case 'c':
+                Configfilename = optarg;
                 break;
             case 'v':
                 if(!Logfilename)
                     Verbose++;
                 break;
-            case 'h':
-                Host = optarg;
-                break;
-            case 'p':
-                Passcode = optarg;
-                break;
-            case 'I':
-                Mcast_address_text = optarg;
-                break;
-            case 'L':
-                Latitude = optarg;
-                break;
-            case 'G':
-                Longitude = optarg;
-                break;
-            case 'A':
-                Altitude = optarg;
-                break;
-            case 'C':
-                Comment = optarg;
-                break;
-            case 'S':
-                Symbol = optarg;
-                break;
-            case 'O':
-                Overlay = optarg;
-                break;
-            case 'B':
-                Beaconing = optarg;
-                break;
-            case 'T':
-                TelemSeqFilename = optarg;
-                break;
-            case 'H':
-                GPSDHost = optarg;
-                break;
-            case 'M':
-                Mobile = optarg;
-                break;
             case 'V':
                 VERSION();
                 exit(EX_OK);
             default:
-                fprintf(stderr,"Usage: %s -u user [-p passcode] [-v] [-I mcast_address][-h host] [-L latitude] [-G longitude] [-A altitude] [-C comment string] [-S symbol char] [-O overlay char] [-B 0|1] [-T telemetry sequence filename] [-H gpsd hostname] [-M 0|1]\n",argv[0]);
-
-                for (int k = 0; k < argc; k++) {
-                    fprintf(stderr, "argv[%d]: %s\n", k, argv[k]);
-                }
-
+                fprintf(stderr,"Usage: %s [-v] [-V] [-f <log file>] [-c <config file>]\n",argv[0]);
                 exit(EX_USAGE);
         }
     }
 
 
-    if(Logfilename)
-        Logfile = fopen(Logfilename,"a");
-    else if (Verbose)
-        Logfile = stdout;
+    // --------------------- start: read configuration file ------------------
+    //
 
-    if (Logfile) {
-        setlinebuf(Logfile);
-        format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns());
-        fprintf(Logfile,"%s ################## START:  igate ##############\n", timebuffer);
+    initigateconfig(&igate_configuration);
+    initlocation(&location);
+    initpacketstatistics(&aprs_statistics);
+    
+
+    // try and open the configuration file (if it was given on the command line)
+    if (Configfilename) {
+        snprintf(igate_configuration.configfilename, sizeof(igate_configuration.configfilename), "%s", Configfilename);
+        igate_configuration.configfile = fopen(igate_configuration.configfilename, "r");
+    }
+
+    // parse through the JSON within the configuration file
+    if (igate_configuration.configfile) {
+        char buffer[4096];
+        int len;
+
+        len = fread(buffer, 1, sizeof(buffer), igate_configuration.configfile);
+        fclose(igate_configuration.configfile);
+
+        // parse the JSON data
+        cJSON *json = cJSON_Parse(buffer);
+        if (json == NULL || len == 0) {
+            const char *error_ptr = cJSON_GetErrorPtr();
+            if (error_ptr != NULL) {
+                fprintf(stderr, "Error reading configuration file: %s\n", error_ptr);
+            }
+            cJSON_Delete(json);
+            exit(EX_IOERR);
+        }
+
+        // This will process any json from the configuration file, and populate the igate_configuration structure
+        processJSONObject(json);
+
     }
     else {
-        fprintf(stderr, "Unable to write to log file:  %s\n", Logfilename);
+        fprintf (stderr, "Unable to open configuration file. Filename not specified.\n");
+        exit(EX_SOFTWARE);
+    }
+    
+    // --------------------- end: read configuration file ------------------
+
+    // If a log filename was supplied on the command line, then we copy that into the igate_configuration structure
+    if(Logfilename) {
+        snprintf (igate_configuration.logfilename, sizeof(igate_configuration.logfilename), "%s", Logfilename);
+        igate_configuration.logfile = fopen(igate_configuration.logfilename,"a");
+    }
+    else // otherwise, we just write to stdout
+        igate_configuration.logfile = stdout;
+
+    // Try and write to the log file.  This will shake out any permissions issues writing to that file before we get too far along.
+    if (igate_configuration.logfile) {
+        setlinebuf(igate_configuration.logfile);
+        format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns());
+        fprintf(igate_configuration.logfile,"%s ################## START:  igate ##############\n", timebuffer);
+    }
+    else {
+        fprintf(stderr, "Unable to write to log file:  %s\n", igate_configuration.logfilename);
         exit(EX_IOERR);
     }
 
-    if(User == NULL) {
+    // check the callsign
+    if(igate_configuration.callsign == NULL) {
         fprintf(stderr,"Must specify a callsign for to use as the user when igating to APRS-IS:  -u User\n");
         exit(EX_USAGE);
     }
 
 
-    if(!Passcode) {
+    // if no APRS-IS passcode was supplied, then determine it on the fly
+    if(strlen(igate_configuration.passcode) == 0) {
         // Calculate trivial hash authenticator
         int hash = 0x73e2;
-        char callsign[11];
-        strlcpy(callsign,User,sizeof(callsign));
+        char callsign[16];
+        strlcpy(callsign,igate_configuration.callsign,sizeof(callsign));
         char *cp;
         if((cp = strchr(callsign,'-')) != NULL)
             *cp = '\0';
@@ -298,67 +325,52 @@ int main(int argc,char *argv[])
             hash ^= toupper(callsign[i+1]);
         }
         hash &= 0x7fff;
-        if(asprintf(&Passcode,"%d",hash) < 0) {
+        if(snprintf(igate_configuration.passcode, sizeof(igate_configuration.passcode), "%d",hash) <= 0) {
             fprintf(stderr,"Unexpected error in computing passcode\n");
             exit(EX_SOFTWARE);
         }
     }
 
-    // initialize our station details
-    initstation(&aprs_station);
 
-    // mobile station or static?
+    // Log if this is a mobile or static station
     format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns());
-    int m = atoi(Mobile);
-    if (m) {
-        ismobile = true;
-        fprintf(Logfile, "%s Mobile station behavior selected.\n", timebuffer);
-    }
-    else 
-        fprintf(Logfile, "%s Static station behavior selected.\n", timebuffer);
+    fprintf(igate_configuration.logfile, "%s %s station behavior selected.\n", timebuffer, (igate_configuration.ismobile ? "mobile" : "static"));
 
-
-    // Check if beaconing was enabled
-    int b = atoi(Beaconing);
-
-    if (b > 0) { // beaconing was enabled
-
-        beaconing_enabled = true;
+    // if beaconing was enabled, then try and read the telemetry sequency file
+    if (igate_configuration.aprsisbeaconing) { 
 
         // get the starting sequence number for telemetry packets sent to the APRS-IS server
-        sequence = readtelemseq(TelemSeqFilename);
+        igate_configuration.sequence = readtelemseq(igate_configuration.telemseqfilename);
 
         // get timestamp for printing output below
         format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns());
-        fprintf(Logfile, "%s Beaconing to %s enabled.  Initial telemetry sequence: %d\n", timebuffer, Host, sequence);
+        fprintf(igate_configuration.logfile, "%s Beaconing to %s enabled.  Initial telemetry sequence: %d\n", 
+                timebuffer, 
+                igate_configuration.aprsishost, 
+                igate_configuration.sequence
+                );
 
-        // check the symbol/overlay/comment fields
-        if (Symbol && Overlay && Comment) {
-            strncpy(aprs_station.symbol, Symbol, sizeof(aprs_station.symbol)-1);
-            strncpy(aprs_station.overlay, Overlay, sizeof(aprs_station.overlay)-1);
-            strncpy(aprs_station.comment, Comment, sizeof(aprs_station.comment)-1);
-            fprintf(Logfile, "%s Station identification:  symbol=%s, overlay=%s, comment=%s\n", timebuffer, Symbol, Overlay, Comment);
-        }
+        // log our symbol, overlay, & comment strings...but only since we're beaconing, otherwise they don't matter
+        fprintf(igate_configuration.logfile, "%s Station identification:  symbol=%s, overlay=%s, comment=%s\n", 
+                timebuffer, 
+                igate_configuration.symbol, 
+                igate_configuration.overlay, 
+                igate_configuration.comment
+                );
 
-        if (GPSDHost == NULL && Latitude && Longitude && Altitude) { // we're using the provided LAT, LON, ALT parameters
-
-            gpsd_enabled = false;
-
-            // populate this station's location details
-            aprs_station.lat = atof(Latitude);
-            aprs_station.lon = atof(Longitude);
-            aprs_station.alt = atof(Altitude);
-
-            fprintf(Logfile, "%s Using provided latitude=%s, longitude=%s, altitude=%s\n", timebuffer, Latitude, Longitude, Altitude);
-        }
-        else if (GPSDHost) {
-            gpsd_enabled = true;
-            fprintf(Logfile, "%s Using GPSD on %s for location of this station.\n", timebuffer, GPSDHost);
-        }
+        // print out a message about how we're using GPSD (or not)
+        if (igate_configuration.gpsdenabled) 
+            fprintf(igate_configuration.logfile, "%s Using GPSD on %s for location of this station.\n", timebuffer, igate_configuration.gpsdhost);
+        else
+            fprintf(igate_configuration.logfile, "%s Using provided latitude=%f, longitude=%f, altitude=%f\n", 
+                    timebuffer, 
+                    location.lat, 
+                    location.lon, 
+                    location.alt
+                    );
     }
     else {  // beaconing was not enabled
-        beaconing_enabled = false;
-        fprintf(Logfile, "%s Not configured to beacon to APRS-IS.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
+        fprintf(igate_configuration.logfile, "%s Not configured to beacon to APRS-IS.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
     }
 
 
@@ -382,9 +394,9 @@ int main(int argc,char *argv[])
 
         // Try a few times in case we come up before the resolver is quite ready
         for(int tries=0; tries < 10; tries++) {
-            if((ecode = getaddrinfo(Host,Port,&hints,&results)) == 0)
+            if((ecode = getaddrinfo(igate_configuration.aprsishost,igate_configuration.aprsisport,&hints,&results)) == 0)
                 break;
-            fprintf(Logfile, "%s resolver loop sleeping for 500ms.\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()));
+            fprintf(igate_configuration.logfile, "%s resolver loop sleeping for 500ms.\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()));
             struct timespec tv;
             tv.tv_sec = 0;
             tv.tv_nsec = 5 * 100000000ll;
@@ -393,8 +405,8 @@ int main(int argc,char *argv[])
         }
 
         if(ecode != 0) {
-            fprintf(stderr,"Can't getaddrinfo(%s,%s): %s\n",Host,Port,gai_strerror(ecode));
-            fprintf(Logfile, "%s ecode sleeping for 5s.\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()));
+            fprintf(stderr,"Can't getaddrinfo(%s,%s): %s\n",igate_configuration.aprsishost,igate_configuration.aprsisport,gai_strerror(ecode));
+            fprintf(igate_configuration.logfile, "%s ecode sleeping for 5s.\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()));
 
             struct timespec tv;
             tv.tv_sec = 5;
@@ -415,8 +427,12 @@ int main(int argc,char *argv[])
         }
 
         if(resp == NULL) {
-            fprintf(stderr,"Can't connect to server %s:%s\n",Host,Port);
-            fprintf(Logfile, "%s Can't connect to server %s:%s, sleeping for 2mins.\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()), Host, Port);
+            fprintf(stderr,"Can't connect to server %s:%s\n", igate_configuration.aprsishost, igate_configuration.aprsisport);
+            fprintf(igate_configuration.logfile, "%s Can't connect to server %s:%s, sleeping for 2mins.\n", 
+                    format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()), 
+                    igate_configuration.aprsishost, 
+                    igate_configuration.aprsisport
+                    );
 
             struct timespec tv;
             tv.tv_sec = 60*2;
@@ -431,10 +447,8 @@ int main(int argc,char *argv[])
         // end:  resolve and connect to aprs-is server
         // --------------------------------------
 
-        if(Logfile) {
-            format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns());
-            fprintf(Logfile,"%s Connected to APRS server %s port %s\n", timebuffer, resp->ai_canonname,Port);
-        }
+        format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns());
+        fprintf(igate_configuration.logfile,"%s Connected to APRS server %s port %s\n", timebuffer, resp->ai_canonname,igate_configuration.aprsisport);
 
         freeaddrinfo(results);
         resp = results = NULL;
@@ -444,20 +458,20 @@ int main(int argc,char *argv[])
 
         // start threads
         pthread_create(&Read_thread,NULL,netreader,NULL);
-        if (beaconing_enabled)
+        if (igate_configuration.aprsisbeaconing)
             pthread_create(&Beacon_thread,NULL,beaconthread,NULL);
-        if (gpsd_enabled)
+        if (igate_configuration.gpsdenabled)
             pthread_create(&GPSD_thread,NULL,gpsthread,NULL);
 
 
         // Log into the APRS-IS server 
-        if(fprintf(network,"user %s pass %s vers KA9Q-aprs 1.0\r\n",User,Passcode) <= 0) {
+        if(fprintf(network,"user %s pass %s vers KA9Q-aprs 1.0\r\n",igate_configuration.callsign,igate_configuration.passcode) <= 0) {
 
             // if there was error, then we close our connection, sleep for 5mins, then restart this outer 'while loop' back at the beginning.
             fclose(network);
             network = NULL;
 
-            fprintf(Logfile, "%s login step.  sleeping for 5mins.\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()));
+            fprintf(igate_configuration.logfile, "%s login step.  sleeping for 5mins.\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()));
             struct timespec tv;
             tv.tv_sec = 600;
             tv.tv_nsec = 0;
@@ -526,23 +540,20 @@ int main(int argc,char *argv[])
                 continue; // Wrong type
 
             // print the start of a log message.  this includes timestamp, etc..but no newline...as that'll be written down below...
-            if(Logfile) {
-                // Emit local timestamp
-                char result[1024];
+            // Emit local timestamp
+            char result[1024];
 
-                fprintf(Logfile,"%s ssrc %u seq %d",
-                        format_gpstime(result,sizeof(result),gps_time_ns()),
-                        rtp_header.ssrc,rtp_header.seq);
-            }
+            fprintf(igate_configuration.logfile,"%s ssrc %u seq %d",
+                    format_gpstime(result,sizeof(result),gps_time_ns()),
+                    rtp_header.ssrc,rtp_header.seq);
 
             // Parse incoming AX.25 frame
             struct ax25_frame frame;
             if(ax25_parse(&frame,dp,size) < 0) {
-                if(Logfile)
-                    fprintf(Logfile," Unparsable packet\n");
+                fprintf(igate_configuration.logfile," Unparsable packet\n");
 
                 pthread_mutex_lock(&stats_lock);
-                dropped_pkts++;
+                aprs_statistics.dropped++;
                 pthread_mutex_unlock(&stats_lock);
 
                 // restart at the beginning of this inner loop as this was an unparsable AX25 frame
@@ -595,15 +606,12 @@ int main(int argc,char *argv[])
                     heard_direct = 0;
 
                 // print out if we heard this station directly or not
-                if(Logfile) {
-                    fprintf(Logfile, " direct %d", heard_direct);
-                }
-
+                fprintf(igate_configuration.logfile, " direct %d", heard_direct);
 
                 {
                     // qAR means a bidirectional i-gate, qAO means receive-only
-                    //    w = snprintf(cp,sspace,",qAR,%s",User);
-                    int const w = snprintf(cp,sspace,",qAO,%s",User);
+                    //    w = snprintf(cp,sspace,",qAR,%s",igate_configuration.callsign);
+                    int const w = snprintf(cp,sspace,",qAO,%s",igate_configuration.callsign);
                     cp += w;
                     sspace -= w;
                     *cp++ = ':';
@@ -629,23 +637,19 @@ int main(int argc,char *argv[])
             // make sure there wasn't something odd happening with the buffers
             assert(sizeof(monstring) - sspace - 1 == strlen(monstring));
 
-            // print the rest of the log message
-            if(Logfile)
-                fprintf(Logfile," %s\n",monstring);
-
             // ------------------ start:  stats ------------------------------
             
             // if heard directly, then update that counter
             if (heard_direct) {
                 pthread_mutex_lock(&stats_lock);
-                heard_direct_pkts++;
+                aprs_statistics.direct++;
                 pthread_mutex_unlock(&stats_lock);
             }
 
             pthread_mutex_lock(&stats_lock);
-            received_pkts++;
+            aprs_statistics.received++;
             if (rtp_header.ssrc == 145825)
-                received_sat_pkts++;
+                aprs_statistics.satellite++;
             pthread_mutex_unlock(&stats_lock);
 
             // ------------------ end:  stats ------------------------------
@@ -653,65 +657,62 @@ int main(int argc,char *argv[])
 
             // ------------------- start:  check for drop conditions ---------------
             if(frame.control != 0x03 || frame.type != 0xf0) {
-                if(Logfile)
-                    fprintf(Logfile," Not relaying: invalid ax25 ctl/protocol\n");
+                fprintf(igate_configuration.logfile," %s -- Not relaying: invalid ax25 ctl/protocol\n", monstring);
 
                 pthread_mutex_lock(&stats_lock);
-                dropped_pkts++;
+                aprs_statistics.dropped++;
                 pthread_mutex_unlock(&stats_lock);
 
                 continue;
             }
             if(infolen == 0) {
-                if(Logfile)
-                    fprintf(Logfile," Not relaying: empty I field\n");
+                fprintf(igate_configuration.logfile," %s -- Not relaying: empty I field\n", monstring);
 
                 pthread_mutex_lock(&stats_lock);
-                dropped_pkts++;
+                aprs_statistics.dropped++;
                 pthread_mutex_unlock(&stats_lock);
 
                 continue;
             }
             if(is_rfonly) {
-                if(Logfile)
-                    fprintf(Logfile," Not relaying: RF only or TCPIP packet\n");
+                fprintf(igate_configuration.logfile," %s -- Not relaying: RF only or TCPIP packet\n", monstring);
 
                 pthread_mutex_lock(&stats_lock);
-                dropped_pkts++;
+                aprs_statistics.dropped++;
                 pthread_mutex_unlock(&stats_lock);
 
                 continue;
             }
             if(frame.information[0] == '{') {
-                if(Logfile)
-                    fprintf(Logfile," Not relaying: third party traffic\n");
+                fprintf(igate_configuration.logfile," %s -- Not relaying: third party traffic\n", monstring);
 
                 pthread_mutex_lock(&stats_lock);
-                dropped_pkts++;
+                aprs_statistics.dropped++;
                 pthread_mutex_unlock(&stats_lock);
 
                 continue;
             }
             if (is_satellite && heard_direct) {
-                if(Logfile)
-                    fprintf(Logfile," Not relaying: satellite packet heard directly\n");
+                fprintf(igate_configuration.logfile," %s -- Not relaying: satellite packet heard directly\n", monstring);
                 continue;
             }
 
             // ------------------- end:  check for drop conditions ---------------
 
+            // print the rest of the log message
+            fprintf(igate_configuration.logfile," %s\n", monstring);
 
             int ret;
 
             // Send to APRS network with appended crlf
             pthread_mutex_lock(&tcp_lock);
-            ret = fprintf(network,"%s\r\n",monstring);
+            ret = fprintf(network,"%s\r\n", monstring);
             pthread_mutex_unlock(&tcp_lock);
 
             if (ret <= 0) {
 
-                fprintf(stderr,"Error communicating to server, %s:%s\n",Host,Port);
-                fprintf(Logfile, "%s Exiting, error communicating to server, %s:%s.\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()), Host, Port);
+                fprintf(stderr,"Error communicating to server, %s:%s\n",igate_configuration.aprsishost,igate_configuration.aprsisport);
+                fprintf(igate_configuration.logfile, "%s Exiting, error communicating to server, %s:%s.\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()), igate_configuration.aprsishost, igate_configuration.aprsisport);
 
                 // error!
                 fclose(network);
@@ -733,11 +734,10 @@ int main(int argc,char *argv[])
         } // inner while loop
     } // outer while loop
 
-    if (Logfile) 
-        fprintf(Logfile, "%s Done.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
-
-    if (Logfilename && Logfile)
-        fclose(Logfile);
+    if (igate_configuration.logfile) {
+        fprintf(igate_configuration.logfile, "%s Done.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
+        fclose(igate_configuration.logfile);
+    }
 }
 
 
@@ -764,19 +764,15 @@ void *netreader(void *arg)
         // increment our counter
         num++;
 
-        // write all incoming data from the APRS-IS server to our log file
-        if(Logfile) {
-
-            // right trim off any newline/carrage return/spaces from the line we read from the APRS-IS server and place '\0' char at that location.
-            char *end = line + strlen(line) -1;
-            while (end > line && isspace(*end)) {
-                end--;
-            }
-            *(end+1) = '\0';
-
-            fprintf(Logfile, "%s %s: %s\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), Host, line);
-            //fwrite(line,linelen,1,Logfile);
+        // right trim off any newline/carrage return/spaces from the line we read from the APRS-IS server and place '\0' char at that location.
+        char *end = line + strlen(line) -1;
+        while (end > line && isspace(*end)) {
+            end--;
         }
+        *(end+1) = '\0';
+
+        fprintf(igate_configuration.logfile, "%s %s: %s\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), igate_configuration.aprsishost, line);
+        //fwrite(line,linelen,1,igate_configuration.logfile);
 
         // if more 2 lines have been received from the APRS-IS server, then we signal the writing thread that its clear to xmit
         if (num > 1 && beacon_locked) {
@@ -792,29 +788,13 @@ void *netreader(void *arg)
 
 // ---------------------------------------------------------------------
 // ---------------------------------------------------------------------
-// Initialize station structure
-void initstation(APRS_STATION *station)
-{
-    station->lat = 0;
-    station->lon = 0;
-    station->alt = 0;
-    station->course = 0;
-    station->speed = 0;
-    memset(station->symbol, 0, sizeof(station->symbol));
-    memset(station->overlay, 0, sizeof(station->overlay));
-    memset(station->comment, 0, sizeof(station->comment));
-}
-
-
-// ---------------------------------------------------------------------
-// ---------------------------------------------------------------------
 // Shutdown the application.  Should be called from kill signals.
 void closedown(int x)
 {
     char timebuffer[1024];
 
     if (Verbose)
-        fprintf(Logfile, "%s Stopping app.  Received signal: %d\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()), x);
+        fprintf(igate_configuration.logfile, "%s Stopping app.  Received signal: %d\n", format_gpstime(timebuffer,sizeof(timebuffer), gps_time_ns()), x);
 
     // Set the global to true so that processing loops close down
     stop_processing = true;
@@ -870,8 +850,14 @@ void writetelemseq(char *filename, int seq)
     // write the sequence provide to the file.  This will overwrite the file, btw.
     if (filename) {
         telemfile = fopen(filename, "w");
-        fprintf(telemfile, "%d\n", seq);
-        fclose(telemfile);
+        if (telemfile) {
+            fprintf(telemfile, "%d\n", seq);
+            fclose(telemfile);
+        }
+        else {
+            fprintf(stderr, "Unable to write telemetry sequence, %d, to filename, %s.  Errno: %d\n", seq, filename, errno);
+            stop_processing = true;
+        }
     }
 }
 
@@ -890,7 +876,7 @@ int positpacket(char *buffer, size_t n, char *info)
     int minutes = ts->tm_min;
     int seconds = ts->tm_sec;
 
-    return snprintf (buffer, n, "%s>%s,TCPIP*:/%02d%02d%02dh%s", User, tocall, hours, minutes, seconds, info);
+    return snprintf (buffer, n, "%s>%s,TCPIP*:/%02d%02d%02dh%s", igate_configuration.callsign, tocall, hours, minutes, seconds, info);
 
 }
 
@@ -909,6 +895,8 @@ int telemetrypacket(char *buffer, size_t n, APRS_EQNS *eqns)
     int adjusted_dropped;
     int adjusted_receive_sat;
     int adjusted_direct;
+    int pct_dropped;
+    int pct_direct;
 
     // sanity check
     if (buffer == NULL)
@@ -918,34 +906,46 @@ int telemetrypacket(char *buffer, size_t n, APRS_EQNS *eqns)
     pthread_mutex_lock(&stats_lock);
 
     // save the received and dropped packet values to local variables, then reset them back to zero
-    received = received_pkts;
-    dropped = dropped_pkts;
-    received_sat = received_sat_pkts;
-    heard_direct = heard_direct_pkts;
-    received_pkts = 0;
-    dropped_pkts = 0;
-    received_sat_pkts = 0;
-    heard_direct_pkts = 0;
+    received = aprs_statistics.received;
+    dropped = aprs_statistics.dropped;
+    received_sat = aprs_statistics.satellite;
+    heard_direct = aprs_statistics.direct;
+    aprs_statistics.received = 0;
+    aprs_statistics.dropped = 0;
+    aprs_statistics.satellite = 0;
+    aprs_statistics.direct = 0;
 
     // unlock the stats mutex
     pthread_mutex_unlock(&stats_lock);
 
+    // calculate the % dropped and direct
+    pct_dropped = (int) round(100.0 * (double) dropped / (double) received);
+    pct_direct = (int)round(100.0 * (double) heard_direct / (double) received);
+
     // Determine coefficients for the APRS equations packet.  We do this because telemetry values can only range from 0-255.
     adjusted_receive = calculatecoef(received, &(eqns->rx));
-    adjusted_dropped = calculatecoef(dropped, &(eqns->drp));
     adjusted_receive_sat = calculatecoef(received_sat, &(eqns->rxsat));
-    adjusted_direct = calculatecoef(heard_direct, &(eqns->rxdirect));
+    adjusted_dropped = calculatecoef(pct_dropped, &(eqns->drp));
+    adjusted_direct = calculatecoef(pct_direct, &(eqns->rxdirect));
 
     // write the telemetry packet string to the supplied buffer.
-    num = snprintf(buffer, n, "%s>%s,TCPIP*:T#%03d,%03d,%03d,%03d,%03d,%03d,00000000,Telemetry report", User, tocall, sequence, adjusted_receive, adjusted_dropped, adjusted_receive_sat, adjusted_direct, 0);
+    num = snprintf(buffer, n, "%s>%s,TCPIP*:T#%03d,%03d,%03d,%03d,%03d,%03d,00000000,Telemetry report", 
+            igate_configuration.callsign, 
+            tocall, 
+            igate_configuration.sequence, 
+            adjusted_receive, 
+            adjusted_receive_sat, 
+            adjusted_dropped, 
+            adjusted_direct, 
+            0);
 
     // check the sequence number.  If > 999, then we roll it back to 000.
-    sequence++;
-    if (sequence > 999 || sequence < 0)
-        sequence = 0;
+    igate_configuration.sequence++;
+    if (igate_configuration.sequence > 999 || igate_configuration.sequence < 0)
+        igate_configuration.sequence = 0;
 
     // write the last telemetry sequence to the telemetry sequence file
-    writetelemseq(TelemSeqFilename, sequence);
+    writetelemseq(igate_configuration.telemseqfilename, igate_configuration.sequence);
 
     return num;
 
@@ -955,7 +955,7 @@ int telemetrypacket(char *buffer, size_t n, APRS_EQNS *eqns)
 // ---------------------------------------------------------------------
 // ---------------------------------------------------------------------
 // for a given set of station details, fill a buffer with the constructed information string (as part of an APRS packet)
-int createinfostring(char *buffer, size_t n, APRS_STATION *station)
+int createinfostring(char *buffer, size_t n, LOCATION *station)
 {
     float local_lat, local_lon, lat_ms, lon_ms;
     int lat_d, lon_d, infosize, num;
@@ -1000,7 +1000,7 @@ int createinfostring(char *buffer, size_t n, APRS_STATION *station)
 
     // construct the course/speed string
     memset(csespd, 0, sizeof(csespd));
-    if (ismobile) {
+    if (igate_configuration.ismobile) {
         double c = round(station->course);
         double s = round(station->speed * 10);
 
@@ -1027,16 +1027,16 @@ int createinfostring(char *buffer, size_t n, APRS_STATION *station)
     sym[0] = sym[1] = ovl[0] = ovl[1] = '\0';
 
     // is the first character of the symbol the primary or alternate table identifier?
-    if (strncmp(station->symbol, "/", 1) == 0) {
+    if (strncmp(igate_configuration.symbol, "/", 1) == 0) {
         // primary table selected
-        sym[0] = station->symbol[1];
+        sym[0] = igate_configuration.symbol[1];
         ovl[0] = '/';
     }
-    else if (strncmp(station->symbol, "\\", 1) == 0) {
+    else if (strncmp(igate_configuration.symbol, "\\", 1) == 0) {
         // alternate table selected
-        sym[0] = station->symbol[1];
-        if (station->overlay[0] != '\0')
-            ovl[0] = station->overlay[0];
+        sym[0] = igate_configuration.symbol[1];
+        if (igate_configuration.overlay[0] != '\0')
+            ovl[0] = igate_configuration.overlay[0];
         else
             ovl[0] = '\\';
     }
@@ -1047,7 +1047,7 @@ int createinfostring(char *buffer, size_t n, APRS_STATION *station)
     }
     
     // Create the information string, saved to the buffer.  If the comment string is too long, then that is truncated at the 'infosize' mark.
-    num = snprintf(buffer, infosize, "%s%s%s%s%s/A=%06d%s", lat_string, ovl, lon_string, sym, csespd, (int) station->alt, station->comment);
+    num = snprintf(buffer, infosize, "%s%s%s%s%s/A=%06d%s", lat_string, ovl, lon_string, sym, csespd, (int) station->alt, igate_configuration.comment);
 
     // return the number of bytes written to the buffer
     return num;
@@ -1086,10 +1086,10 @@ int eqnpacket(char *buffer, size_t n, APRS_EQNS *eqns)
         return 0;
 
     return snprintf(buffer, n, "%s>%s,TCPIP*::%-9s:EQNS.%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,0,0,0", 
-            User, tocall, User, 
+            igate_configuration.callsign, tocall, igate_configuration.callsign, 
             eqns->rx.a, eqns->rx.b, eqns->rx.c, 
-            eqns->drp.a, eqns->drp.b, eqns->drp.c, 
             eqns->rxsat.a, eqns->rxsat.b, eqns->rxsat.c, 
+            eqns->drp.a, eqns->drp.b, eqns->drp.c, 
             eqns->rxdirect.a, eqns->rxdirect.b, eqns->rxdirect.c 
             );
 
@@ -1103,7 +1103,7 @@ int parampacket(char *buffer, size_t n)
     if (buffer == NULL)
         return 0;
 
-    return snprintf(buffer, n, "%s>%s,TCPIP*::%-9s:PARM.Rx10m,Drop10m,RxSat10m,RxDirect10m", User, tocall, User);
+    return snprintf(buffer, n, "%s>%s,TCPIP*::%-9s:PARM.Rx10m,RxSat10m,PctDrop10m,PctRxDirect10m", igate_configuration.callsign, tocall, igate_configuration.callsign);
 
 }
 
@@ -1115,7 +1115,7 @@ int unitspacket(char *buffer, size_t n)
     if (buffer == NULL)
         return 0;
 
-    return snprintf(buffer, n, "%s>%s,TCPIP*::%-9s:UNIT.Pkts,Pkts,Pkts,Pkts", User, tocall, User);
+    return snprintf(buffer, n, "%s>%s,TCPIP*::%-9s:UNIT.Pkts,Pkts,%%,%%", igate_configuration.callsign, tocall, igate_configuration.callsign);
 
 }
 
@@ -1127,7 +1127,7 @@ int bitspacket(char *buffer, size_t n)
     if (buffer == NULL)
         return 0;
 
-    return snprintf(buffer, n, "%s>%s,TCPIP*::%-9s:BITS.00000000,KA9Q-radio Telemetry", User, tocall, User);
+    return snprintf(buffer, n, "%s>%s,TCPIP*::%-9s:BITS.00000000,KA9Q-radio Telemetry", igate_configuration.callsign, tocall, igate_configuration.callsign);
 
 }
 
@@ -1175,7 +1175,6 @@ void *beaconthread(void *arg)
     FILE *network = fdopen(Network_fd,"w");
     setlinebuf(network);
 
-
     // We don't want to conenct to the APRS-IS server until our connection to that server was successful.  So we wait until the reader thread has received confirmation from the APRS-IS server and has 
     // signaled that we can continue.
     
@@ -1195,20 +1194,20 @@ void *beaconthread(void *arg)
         xmit_telemetry = false;
         xmit_posit = false;
         
-        if (gpsd_enabled) {
+        if (igate_configuration.gpsdenabled) {
 
-            // lock the aprs_station structure to determine if our position has changed
-            pthread_mutex_lock(&aprs_station_lock);
-            if (gpsmode >= 3 && (((aprs_station.lat - last_lat > 0.0001 || aprs_station.lon - last_lon > 0.0001 || aprs_station.alt - last_alt > 100) && elapsed_posit > posit_max / 4) || elapsed_posit > posit_max)) {
-                last_lat = aprs_station.lat;
-                last_lon = aprs_station.lon;
-                last_alt = aprs_station.alt;
+            // lock the location structure to determine if our position has changed
+            pthread_mutex_lock(&location_lock);
+            if (location.gpsmode >= 3 && (((location.lat - last_lat > 0.0001 || location.lon - last_lon > 0.0001 || location.alt - last_alt > 100) && elapsed_posit > posit_max / 4) || elapsed_posit > posit_max)) {
+                last_lat = location.lat;
+                last_lon = location.lon;
+                last_alt = location.alt;
 
                 // initialize our info_string buffer
                 memset(info_string, 0, sizeof(info_string));
 
                 // create the information field for this position packet
-                if (createinfostring(info_string, sizeof(info_string), &aprs_station) > 0) {
+                if (createinfostring(info_string, sizeof(info_string), &location) > 0) {
 
                     // initialize out packet buffer
                     memset(packet_string, 0, sizeof(packet_string));
@@ -1222,7 +1221,7 @@ void *beaconthread(void *arg)
             }
 
             // unlock 
-            pthread_mutex_unlock(&aprs_station_lock);
+            pthread_mutex_unlock(&location_lock);
 
         }
         else {  // not GPSD enabled, so we'll just look to periodically transmit the static position of this station
@@ -1234,7 +1233,7 @@ void *beaconthread(void *arg)
                 memset(info_string, 0, sizeof(info_string));
 
                 // create the information field for this position packet
-                if (createinfostring(info_string, sizeof(info_string), &aprs_station) > 0) {
+                if (createinfostring(info_string, sizeof(info_string), &location) > 0) {
 
                     // initialize out packet buffer
                     memset(packet_string, 0, sizeof(packet_string));
@@ -1270,7 +1269,7 @@ void *beaconthread(void *arg)
         if (xmit_posit) {
 
             // Send our position packet to the APRS-IS server
-            fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), packet_string);
+            fprintf(igate_configuration.logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), packet_string);
             ret = fprintf(network, "%s\r\n", packet_string);
 
             // reset elapsed time since last transmission.
@@ -1279,11 +1278,11 @@ void *beaconthread(void *arg)
 
         if (ret && xmit_telemetry) {
 
-            fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), telem);
-            fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), eqns);
-            fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), params);
-            fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), units);
-            fprintf(Logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), bits);
+            fprintf(igate_configuration.logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), telem);
+            fprintf(igate_configuration.logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), eqns);
+            fprintf(igate_configuration.logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), params);
+            fprintf(igate_configuration.logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), units);
+            fprintf(igate_configuration.logfile, "%s xmitting packet: %s\n", format_gpstime(timestring,sizeof(timestring), gps_time_ns()), bits);
 
             // send telemetry packets to the APRS-IS server
             if (ret)
@@ -1344,18 +1343,18 @@ void *gpsthread(void *arg)
     // outer loop for (re)connecting to the GPSD instance
     while (!stop_processing) {
 
-        if (GPSDHost != NULL)
-            gpshost = GPSDHost;
+        if (igate_configuration.gpsdenabled)
+            gpshost = igate_configuration.gpsdhost;
 
         if (0 != gps_open(gpshost, "2947", &gps_data)) {
-            fprintf(Logfile, "%s Unable to connect to GPSD on %s.  trycount=%d\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), gpshost, trycount);
+            fprintf(igate_configuration.logfile, "%s Unable to connect to GPSD on %s.  trycount=%d\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), gpshost, trycount);
 
             // sleep for a few microseconds.  Ramping up the sleep time as the trycount gets large (i.e. we've lost connectivity all together...no sense in just continually retrying).
             float usecs = 10 * exp(trycount);
             usleep(usecs);
         }
         else {
-            fprintf(Logfile, "%s Connected to GPSD on %s.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), gpshost);
+            fprintf(igate_configuration.logfile, "%s Connected to GPSD on %s.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), gpshost);
         }
 
 
@@ -1368,7 +1367,7 @@ void *gpsthread(void *arg)
         // Loop continuously reading from GPSD
         while (gps_waiting(&gps_data, 5000000) && !stop_processing) {
             if (-1 == gps_read(&gps_data, NULL, 0)) {
-                fprintf(Logfile, "%s Unable to read from GPSD on %s.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), gpshost);
+                fprintf(igate_configuration.logfile, "%s Unable to read from GPSD on %s.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), gpshost);
                 break;
             }
 
@@ -1387,21 +1386,21 @@ void *gpsthread(void *arg)
                         fprintf(stdout, "GPS position change: %d %.6f, %.6f\n", gps_data.fix.mode, gps_data.fix.latitude, gps_data.fix.longitude);
 
 
-                    // Update the GPS lat/lon variables on the global aprs_station structure.
-                    pthread_mutex_lock(&aprs_station_lock);
-                    gpsmode = gps_data.fix.mode;
-                    aprs_station.lat = gps_data.fix.latitude;
-                    aprs_station.lon = gps_data.fix.longitude;
-                    aprs_station.alt = gps_data.fix.altitude * 3.2808399; // converted to feet
-                    aprs_station.speed = gps_data.fix.speed * 2.236936; // converted to mph
-                    aprs_station.course = gps_data.fix.track;
-                    pthread_mutex_unlock(&aprs_station_lock);
+                    // Update the GPS lat/lon variables on the global location structure.
+                    pthread_mutex_lock(&location_lock);
+                    location.gpsmode = gps_data.fix.mode;
+                    location.lat = gps_data.fix.latitude;
+                    location.lon = gps_data.fix.longitude;
+                    location.alt = gps_data.fix.altitude * 3.2808399; // converted to feet
+                    location.speed = gps_data.fix.speed * 2.236936; // converted to mph
+                    location.course = gps_data.fix.track;
+                    pthread_mutex_unlock(&location_lock);
 
                 }
                 
                 // reset the trycount since we've just read data from the GPS
                 if (trycount > 0) {
-                    fprintf(Logfile, "%s Reconnected to GPSD on %s.  GPS mode: %d.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), gpshost, gps_data.fix.mode);
+                    fprintf(igate_configuration.logfile, "%s Reconnected to GPSD on %s.  GPS mode: %d.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()), gpshost, gps_data.fix.mode);
                     trycount = 0;
                 }
 
@@ -1415,7 +1414,123 @@ void *gpsthread(void *arg)
     // When you are done...
     (void)gps_stream(&gps_data, WATCH_DISABLE, NULL);
     (void)gps_close(&gps_data);
-    fprintf(Logfile, "%s GPSD thread ended.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
+    fprintf(igate_configuration.logfile, "%s GPSD thread ended.\n", format_gpstime(timebuffer, sizeof(timebuffer), gps_time_ns()));
 
     return NULL;
 }
+
+
+// This will parse the given JSON element array/object and look for configuration settings.  This is recursive.
+void processJSONObject(cJSON *json) {
+    int jsize = cJSON_GetArraySize(json);
+    int i;
+    cJSON *item;
+
+    // loop through each JSON key value
+    for (i = 0; i < jsize; i++) {
+
+        // this particular JSON item
+        item = cJSON_GetArrayItem(json, i);
+
+        // make sure we're able to parse the key/value pair
+        if (item == NULL) {
+            fprintf(stderr, "Unable to get json item: %d\n", i);
+            break;
+        }
+        else {
+
+            // Determine if this key/value pair is actually another object or array.  If it is, we just call ourselves again...
+            if (cJSON_IsObject(item) || cJSON_IsArray(item))
+                processJSONObject(item);
+            else // ...otherwise, it's an "item" so we check it against the configuration elements were looking for.
+                checkForConfigurable(item);
+        }
+    }
+}
+
+
+// check the JSON item for a configuration item
+void checkForConfigurable(cJSON *item) {
+    if (cJSON_IsInvalid(item))
+        return;
+
+    if (strcmp(item->string, "ax25host") == 0)
+        strncpy(igate_configuration.ax25host, item->valuestring, sizeof(igate_configuration.ax25host)-1);
+    else if (strcmp(item->string, "callsign") == 0)
+        strncpy(igate_configuration.callsign, item->valuestring, sizeof(igate_configuration.callsign)-1);
+    else if (strcmp(item->string, "passcode") == 0) 
+       snprintf(igate_configuration.passcode, sizeof(igate_configuration.passcode), "%d", item->valueint);
+    else if (strcmp(item->string, "aprsishost") == 0)
+        strncpy(igate_configuration.aprsishost, item->valuestring, sizeof(igate_configuration.aprsishost)-1);
+    else if (strcmp(item->string, "aprsisport") == 0) {
+        int val = (item->valuedouble > 0 && item->valuedouble < 99999 ? (int) item->valuedouble : 14580);
+        snprintf (igate_configuration.aprsisport, sizeof(igate_configuration.aprsisport), "%d", val);
+    }
+    else if (strcmp(item->string, "aprsisbeaconing") == 0) 
+        igate_configuration.aprsisbeaconing = (cJSON_IsTrue(item) ? true : false);
+    else if (strcmp(item->string, "stationlat") == 0) 
+        location.lat = item->valuedouble;
+    else if (strcmp(item->string, "stationlon") == 0) 
+        location.lon = item->valuedouble;
+    else if (strcmp(item->string, "stationalt") == 0) 
+        location.alt = item->valuedouble;
+    else if (strcmp(item->string, "gpsdhost") == 0)
+        strncpy(igate_configuration.gpsdhost, item->valuestring, sizeof(igate_configuration.gpsdhost)-1);
+    else if (strcmp(item->string, "gpsdenabled") == 0) 
+        igate_configuration.gpsdenabled = (cJSON_IsTrue(item) ? true : false);
+    else if (strcmp(item->string, "symbol") == 0)
+        strncpy(igate_configuration.symbol, item->valuestring, sizeof(igate_configuration.symbol)-1);
+    else if (strcmp(item->string, "overlay") == 0)
+        strncpy(igate_configuration.overlay, item->valuestring, sizeof(igate_configuration.overlay)-1);
+    else if (strcmp(item->string, "comment") == 0)
+        strncpy(igate_configuration.comment, item->valuestring, sizeof(igate_configuration.comment)-1);
+    else if (strcmp(item->string, "ismobile") == 0) 
+        igate_configuration.ismobile = (cJSON_IsTrue(item) ? true : false);
+    else if (strcmp(item->string, "telemseqfilename") == 0)
+        strncpy(igate_configuration.telemseqfilename, item->valuestring, sizeof(igate_configuration.telemseqfilename)-1);
+}
+
+
+// initialize location structure
+void initlocation(LOCATION *loc) {
+    loc->lat = 0.0;
+    loc->lon = 0.0;
+    loc->alt = 0.0;
+    loc->course = 0.0;
+    loc->speed = 0.0;
+    loc->gpsmode = 0;
+}
+
+
+// initialize packet statistics structure
+void initpacketstatistics(PACKET_STATISTICS *stats) {
+    stats->dropped = 0;
+    stats->received = 0;
+    stats->satellite = 0;
+    stats->direct = 0;
+}
+
+// initialize igate configuration structure
+void initigateconfig(IGATE_CONFIGURATION *config) {
+    config->ismobile = false;
+    memset(config->gpsdhost, 0, sizeof(config->gpsdhost));
+    config->gpsdenabled = false;
+    snprintf(config->ax25host, sizeof(config->ax25host), "ax25.local");
+    snprintf(config->aprsishost, sizeof(config->aprsishost), "noam.aprs2.net");
+    snprintf(config->aprsisport, sizeof(config->aprsisport), "14580");
+    config->aprsisbeaconing = false;
+    memset(config->telemseqfilename, 0, sizeof(config->telemseqfilename));
+    config->sequence = 0;
+    memset(config->logfilename, 0, sizeof(config->logfilename));
+    memset(config->callsign, 0, sizeof(config->callsign));
+    memset(config->passcode, 0, sizeof(config->passcode));
+    memset(config->symbol, 0, sizeof(config->symbol));
+    memset(config->overlay, 0, sizeof(config->overlay));
+    memset(config->comment, 0, sizeof(config->comment));
+    memset(config->configfilename, 0, sizeof(config->configfilename));
+    config->logfile = NULL;
+    config->configfile = NULL;
+}
+
+
+

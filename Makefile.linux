@@ -76,7 +76,7 @@ aprsfeed: aprsfeed.o libradio.a
 	$(CC) $(LDOPTS) -o $@ $^ -lbsd -lm -lpthread
 
 igate: igate.o ax25.o libradio.a
-	$(CC) $(LDOPTS) -o $@ $^ -lbsd -lm -lpthread -lgps
+	$(CC) $(LDOPTS) -o $@ $^ -lbsd -lm -lpthread -lgps -lcjson
 
 powerlogger: powerlogger.o ax25.o libradio.a db.o
 	$(CC) $(LDOPTS) -o $@ $^ -lbsd -lm -lpthread -lgps -lpq
