@@ -139,6 +139,9 @@ aprsfeed: aprsfeed.o libradio.a
 control: control.o libradio.a
 	$(CC) $(LDOPTS) -o $@ $^ -liniparser -lncursesw -lbsd -lm -lpthread
 
+aprswatch: aprswatch.o libradio.a
+	$(CC) $(LDOPTS) -o $@ $^ -lbsd -lm -lpthread
+
 igate: igate.o ax25.o libradio.a
 	$(CC) $(LDOPTS) -o $@ $^ -lbsd -lm -lpthread -lgps -lcjson
 
