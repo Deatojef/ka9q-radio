@@ -24,9 +24,9 @@ enum status_type {
   GPS_TIME,      // Nanoseconds since GPS epoch (remember to update the leap second tables!)
 
   DESCRIPTION,   // Free form text describing source
-  UNUSED0,
-  UNUSED1,
-  UNUSED2,
+  STATUS_DEST_SOCKET,
+  SETOPTS,
+  CLEAROPTS,
   UNUSED3,
   UNUSED4,
   INPUT_SAMPRATE, // Nominal sample rate (integer)
@@ -143,7 +143,7 @@ enum status_type {
 
   RF_ATTEN,       // Front end attenuation (introduced with rx888)
   RF_GAIN,        // Front end gain (introduced with rx888)
-  UNUSED10,
+  RF_AGC,         // Front end AGC on/off
   FE_LOW_EDGE,    // edges of front end filter
   FE_HIGH_EDGE,
   FE_ISREAL,        // Boolean, true -> front end uses real sampling, false -> front end uses complex
@@ -152,6 +152,9 @@ enum status_type {
   RTP_PT,           // Real Time Protocol Payload Type
   STATUS_INTERVAL,      // Automatically send channel status over *data* channel every STATUS_RATE frames
   OUTPUT_ENCODING,    // Output data encoding (see enum encoding in multicast.h)
+  SAMPLES_SINCE_OVER, // Samples since last A/D overrange
+  PLL_WRAPS,          // Count of complete linear mode PLL rotations
+  RF_LEVEL_CAL,        // Adjustment relating dBm to dBFS
 };
 
 int encode_string(uint8_t **bp,enum status_type type,void const *buf,unsigned int buflen);

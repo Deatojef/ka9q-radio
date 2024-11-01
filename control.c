@@ -2,7 +2,7 @@
 // Why are user interfaces always the biggest, ugliest and buggiest part of any program?
 // Written as one big polling loop because ncurses is **not** thread safe
 
-// Copyright 2017-2023 Phil Karn, KA9Q
+// Copyright 2017-2024 Phil Karn, KA9Q
 // Major revisions fall 2020, 2023 (really continuous revisions!)
 
 #define _GNU_SOURCE 1
@@ -58,6 +58,7 @@ struct sockaddr_storage Metadata_dest_socket;      // Dest of metadata (typicall
 int Mcast_ttl = DEFAULT_MCAST_TTL;
 int IP_tos = DEFAULT_IP_TOS;
 float Blocktime;
+int Overlap;
 int Output_fd,Status_fd;
 const char *App_path;
 int Verbose;
@@ -68,6 +69,15 @@ static struct control {
   int step;
 } Control;
 
+
+static struct {
+  float noise_bandwidth;
+  float sig_power;
+  float sn0;
+  float snr;
+  int64_t pll_start_time;
+  double pll_start_phase;
+} Local;
 
 static int send_poll(int ssrc);
 static int pprintw(WINDOW *w,int y, int x, char const *prefix, char const *fmt, ...);
@@ -90,11 +100,20 @@ static void process_mouse(struct channel *channel,uint8_t **bpp);
 static bool for_us(struct channel *channel,uint8_t const *buffer,int length,uint32_t ssrc);
 static int init_demod(struct channel *channel);
 
+// Fill in set of locally generated variables from channel structure
+static void gen_locals(struct frontend *frontend,struct channel *channel){
+  Local.noise_bandwidth = fabsf(channel->filter.max_IF - channel->filter.min_IF);
+  Local.sig_power = channel->sig.bb_power - Local.noise_bandwidth * channel->sig.n0;
+  if(Local.sig_power < 0)
+    Local.sig_power = 0; // Avoid log(-x) = nan
+  Local.sn0 = Local.sig_power/channel->sig.n0;
+  Local.snr = power2dB(Local.sn0/Local.noise_bandwidth);
+}
+
 // Pop up a temporary window with the contents of a file in the
 // library directory (usually /usr/local/share/ka9q-radio/)
 // then wait for a single keyboard character to clear it
 static void popup(char const *filename){
-  static int const maxcols = 256;
   char fname[PATH_MAX];
   if (dist_path(fname,sizeof(fname),filename) == -1)
     return;
@@ -103,8 +122,9 @@ static void popup(char const *filename){
     return;
   // Determine size of box
   int rows=0, cols=0;
-  char line[maxcols];
-  while(fgets(line,sizeof(line),fp) != NULL){
+  char *line = NULL;
+  size_t maxcols = 0;
+  while(getline(&line,&maxcols,fp) > 0){
     chomp(line);
     rows++;
     if(strlen(line) > cols)
@@ -116,11 +136,12 @@ static void popup(char const *filename){
   WINDOW * const pop = newwin(rows+2,cols+2,0,0);
   box(pop,0,0);
   int row = 1; // Start inside box
-  while(fgets(line,sizeof(line),fp) != NULL){
+  while(getline(&line,&maxcols,fp) > 0){
     chomp(line);
     mvwaddstr(pop,row++,1,line);
   }
   fclose(fp);
+  FREE(line);
   wnoutrefresh(pop);
   doupdate();
   wtimeout(pop,-1); // blocking read - wait indefinitely
@@ -241,14 +262,14 @@ static struct windef {
   int rows;
   int cols;
 } Windefs[] = {
-  {&Tuning_win, 15, 30},
-  {&Options_win, 15, 12},
+  {&Tuning_win, 18, 30},
+  {&Options_win, 18, 12},
   //  {&Presets_win,Npresets+2,9}, // Npresets is not a static initializer
-  {&Presets_win,15,9},
-  {&Sig_win,15,25},
-  {&Demodulator_win,15,26},
-  {&Filtering_win,15,22},
-  {&Input_win,15,45},
+  {&Presets_win,18,9},
+  {&Sig_win,18,25},
+  {&Demodulator_win,18,26},
+  {&Filtering_win,18,22},
+  {&Input_win,18,45},
   {&Output_win,8,45},
 };
 #define NWINS (sizeof(Windefs) / sizeof(Windefs[0]))
@@ -302,7 +323,7 @@ static void setup_windows(void){
   // A message from our sponsor...
   scrollok(Debug_win,TRUE); // This one scrolls so it can be written to with wprintw(...\n)
   wprintw(Debug_win,"KA9Q-radio %s last modified %s\n",__FILE__,__TIMESTAMP__);
-  wprintw(Debug_win,"Copyright 2023, Phil Karn, KA9Q. May be used under the terms of the GNU Public License\n");
+  wprintw(Debug_win,"Copyright 2024, Phil Karn, KA9Q. May be used under the terms of the GNU Public License\n");
 }
 
 // Comparison for sorting by SSRC
@@ -386,12 +407,15 @@ int main(int argc,char *argv[]){
 	fprintf(stdout,"%d: %s (%s)\n",i,table[i].name,table[i].dns_name);
       fprintf(stdout,"Select index: ");
       fflush(stdout);
-      char line[1024];
-      if(fgets(line,sizeof(line),stdin) == NULL || feof(stdin) || ferror(stdin)){
+      char *line = NULL;
+      size_t linesize = 0;
+      if(getline(&line,&linesize,stdin) <= 0){
 	fprintf(stdout,"EOF on input\n");
+	FREE(line);
 	exit(EX_USAGE);
       }
       n = strtol(line,NULL,0);
+      FREE(line);
       if(n < 0 || n >= radiod_count){
 	fprintf(stdout,"Index %d out of range, try again\n",n);
 	exit(EX_USAGE);
@@ -480,6 +504,7 @@ int main(int argc,char *argv[]){
       struct channel * const channel = calloc(1,sizeof(struct channel));
       init_demod(channel);
       decode_radio_status(&Frontend,channel,buffer+1,length-1);
+
       // Do we already have it?
       int i;
       for(i=0; i < chan_count; i++)
@@ -505,24 +530,22 @@ int main(int argc,char *argv[]){
       if(channel == NULL || channel->output.rtp.ssrc == last_ssrc) // Skip dupes
 	continue;
 
-      float const noise_bandwidth = fabsf(channel->filter.max_IF - channel->filter.min_IF);
-      float sig_power = channel->sig.bb_power - noise_bandwidth * channel->sig.n0;
-      if(sig_power < 0)
-	sig_power = 0; // Avoid log(-x) = nan
-      float const sn0 = sig_power/channel->sig.n0;
-      float const snr = power2dB(sn0/noise_bandwidth);
       char const *ip_addr_string = formatsock(&channel->output.dest_socket);
-      fprintf(stdout,"%13u %9s %'13.f %5.1f %s\n",channel->output.rtp.ssrc,channel->preset,channel->tune.freq,snr,ip_addr_string);
+      gen_locals(&Frontend,channel);
+      fprintf(stdout,"%13u %9s %'13.f %5.1f %s\n",channel->output.rtp.ssrc,channel->preset,channel->tune.freq,Local.snr,ip_addr_string);
       last_ssrc = channel->output.rtp.ssrc;
     }
     fprintf(stdout,"%d channels; choose SSRC, create new SSRC, or hit return to look for more: ",chan_count);
     fflush(stdout);
-    char line[128];
-    if(fgets(line,sizeof(line),stdin) == NULL || feof(stdin) || ferror(stdin)){
+    char *line = NULL;
+    size_t length = 0;
+    if(getline(&line,&length,stdin) <= 0){
       fprintf(stdout,"EOF on input, exiting\n");
+      FREE(line);
       exit(EX_USAGE);
     }
     int const n = strtol(line,NULL,0);
+    FREE(line);
     if(n > 0)
       Ssrc = n; // Will cause a break from this loop
   }
@@ -602,6 +625,8 @@ int main(int argc,char *argv[]){
       wprintw(Debug_win,"got response length %d\n",length);
 #endif
       decode_radio_status(&Frontend,channel,buffer+1,length-1);
+      gen_locals(&Frontend,channel);
+
       // Postpone next poll to specified interval
       next_radio_poll = now + radio_poll_interval + arc4random_uniform(random_interval) - random_interval/2;
       if(Blocktime == 0 && Frontend.samprate != 0)
@@ -794,6 +819,26 @@ static int process_keyboard(struct channel *channel,uint8_t **bpp,int c){
 	encode_float(bpp,HEADROOM,x);
     }
     break;
+  case 'G': // Manually set front end gain, dB (positive or negative)
+    {
+      char str[Entry_width],*ptr;
+      getentry("RF Gain, dB: ",str,sizeof(str));
+      float const x = strtof(str,&ptr);
+      if(ptr != str && isfinite(x)){
+	encode_float(bpp,RF_GAIN,x);
+      }
+    }
+    break;
+  case 'A': // Manually set front end attenuation, dB (positive or negative)
+    {
+      char str[Entry_width],*ptr;
+      getentry("RF Atten, dB: ",str,sizeof(str));
+      float const x = fabsf(strtof(str,&ptr));
+      if(ptr != str && isfinite(x)){
+	encode_float(bpp,RF_ATTEN,x);
+      }
+    }
+    break;
   case 'g': // Manually set linear channel gain, dB (positive or negative)
     {
       char str[Entry_width],*ptr;
@@ -848,7 +893,7 @@ static int process_keyboard(struct channel *channel,uint8_t **bpp,int c){
   case 'k': // Kaiser window parameter
     {
       char str[Entry_width],*ptr;
-      getentry("Kaiser window beta: ",str,sizeof(str));
+      getentry("Kaiser window β: ",str,sizeof(str));
       float const b = strtof(str,&ptr);
       if(ptr != str && isfinite(b)){
 	if(b < 0 || b >= 100){
@@ -885,6 +930,27 @@ static int process_keyboard(struct channel *channel,uint8_t **bpp,int c){
       }
     }
     break;
+  case 'O': // Set/clear aux option flags, mainly for testing
+    {
+      char str[Entry_width],*ptr;
+
+      getentry("enter aux option number [0-63], ! disables: ",str,sizeof(str));
+      bool enable = true;
+      char *cp = strchr(str,'!');
+      if(cp != NULL){
+	enable = false;
+	cp++;
+      } else
+	cp = str;
+      int n = strtol(cp,&ptr,0);
+      if(ptr != cp && n >= 0 && n < 64){
+	if(enable)
+	  encode_int(bpp,SETOPTS,1LL<<n);
+	else
+	  encode_int(bpp,CLEAROPTS,1LL<<n);
+      }
+    }
+    break;
   case 'u':
     {
       char str[Entry_width],*ptr;
@@ -892,6 +958,15 @@ static int process_keyboard(struct channel *channel,uint8_t **bpp,int c){
       int const b = strtol(str,&ptr,0);
       if(ptr != str && b >= 0)
 	encode_int(bpp,STATUS_INTERVAL,b);
+    }
+    break;
+  case 'e':
+    {
+      char str[Entry_width];
+      getentry("Output encoding [s16le s16be f32le f16le opus]: ",str,sizeof(str));
+      enum encoding e = parse_encoding(str);
+      if(e != NO_ENCODING)
+	encode_byte(bpp,OUTPUT_ENCODING,e);
     }
     break;
   default:
@@ -1010,7 +1085,7 @@ static int init_demod(struct channel *channel){
   channel->filter.min_IF = channel->filter.max_IF = channel->filter.kaiser_beta = NAN;
   channel->output.headroom = channel->linear.hangtime = channel->linear.recovery_rate = NAN;
   channel->sig.bb_power = channel->sig.snr = channel->sig.foffset = NAN;
-  channel->fm.pdeviation = channel->linear.cphase = channel->linear.lock_timer = NAN;
+  channel->fm.pdeviation = channel->linear.cphase = NAN;
   channel->output.gain = NAN;
   channel->tp1 = channel->tp2 = NAN;
   return 0;
@@ -1155,8 +1230,7 @@ static void display_filtering(WINDOW *w,struct channel const *channel){
   wmove(w,row,col);
   wclrtobot(w);
   pprintw(w,row++,col,"Fs in","%'d Hz",Frontend.samprate); // Nominal
-  if(channel->output.samprate)
-    pprintw(w,row++,col,"Fs out","%'d Hz",channel->output.samprate);
+  pprintw(w,row++,col,"Fs out","%'d Hz",channel->output.samprate);
 
   pprintw(w,row++,col,"Block Time","%'.1f ms",Blocktime);
   pprintw(w,row++,col,"Block rate","%'.3f Hz",1000.0/Blocktime); // Just the block rate
@@ -1165,16 +1239,16 @@ static void display_filtering(WINDOW *w,struct channel const *channel){
 
   pprintw(w,row++,col,"FFT in","%'lld %c ",N,Frontend.isreal ? 'r' : 'c');
 
-  if(Frontend.samprate && channel->output.samprate)
-    pprintw(w,row++,col,"FFT out","%'lld c ",(int)ceilf((float)N * channel->output.samprate / Frontend.samprate));
+  if(Frontend.samprate != 0)
+    pprintw(w,row++,col,"FFT out","%'lld c ",(long long)N * channel->output.samprate / Frontend.samprate);
 
-  int overlap = 1 + Frontend.L / (Frontend.M - 1); // recreate original overlap parameter
-  pprintw(w,row++,col,"Overlap","1/%d   ",overlap);
+  Overlap = 1 + Frontend.L / (Frontend.M - 1); // recreate original overlap parameter
+  pprintw(w,row++,col,"Overlap","1/%d   ",Overlap);
   pprintw(w,row++,col,"Bin width","%'.3f Hz",(float)Frontend.samprate / N);
 
   float const beta = channel->filter.kaiser_beta;
   if(!isnan(beta))
-    pprintw(w,row++,col,"Kaiser beta","%'.1f   ",beta);
+    pprintw(w,row++,col,"Kaiser β","%'.1f   ",beta);
 
 
 #if 0 // Doesn't really give accurate results
@@ -1220,28 +1294,36 @@ static void display_sig(WINDOW *w,struct channel const *channel){
 	    Frontend.mixer_gain,
 	    Frontend.if_gain);
 
-  pprintw(w,row++,col,"Input","%.1f dBFS ",power2dB(Frontend.if_power));
-  pprintw(w,row++,col,"FE Gain","%.1f dB   ",Frontend.rf_atten + Frontend.rf_gain);
+  // Calculate actual input power in dBm by subtracting net RF gain
+  pprintw(w,row++,col,"Input","%.1f dBm ",
+	  power2dB(Frontend.if_power) - (Frontend.rf_gain - Frontend.rf_atten + Frontend.rf_level_cal));
+  // These gain figures only affect the relative A/D input level in dBFS because an equal
+  // amount of digital attenutation is applied to the A/D output to maintain unity gain
+  pprintw(w,row++,col,"RF Gain","%.1f dB  ",Frontend.rf_gain);
+  pprintw(w,row++,col,"RF Atten","%.1f dB  ",-Frontend.rf_atten);
+  pprintw(w,row++,col,"RF lev cal","%.1f dB  ",Frontend.rf_level_cal);
+  pprintw(w,row++,col,"A/D","%.1f dBFS",power2dB(Frontend.if_power));
+  pprintw(w,row++,col,"Gain offset","%.1f dB  ",-(Frontend.rf_gain - Frontend.rf_atten + Frontend.rf_level_cal));
   if(!isnan(channel->sig.bb_power))
-    pprintw(w,row++,col,"Baseband","%.1f dB   ",power2dB(channel->sig.bb_power));
-  if(!isnan(channel->sig.n0))
-     pprintw(w,row++,col,"N0","%.1f dB/Hz",power2dB(channel->sig.n0));
-
+    pprintw(w,row++,col,"Baseband","%.1f dBm ",power2dB(channel->sig.bb_power));
+  if(!isnan(channel->sig.n0)){
+     pprintw(w,row++,col,"N₀","%.1f dBmJ",power2dB(channel->sig.n0));
+     float temp = channel->sig.n0 / (1000 * BOLTZMANN); // 1000 converts from joules to millijoules (for power in dBm)
+     pprintw(w,row++,col,"N Temp","%.5g K   ",temp);
+     float nf = power2dB(1 + temp / 290); // convert to noise figure
+     pprintw(w,row++,col,"NF","%.1f dB  ",nf);
+  }
   // Derived numbers
-  float sn0 = sig_power/channel->sig.n0;
-  if(!isnan(sn0))
-    pprintw(w,row++,col,"S/N0","%.1f dBHz ",power2dB(sn0));
-  if(!isnan(noise_bandwidth))
-    pprintw(w,row++,col,"NBW","%.1f dBHz ",power2dB(noise_bandwidth));
-  if(!isnan(sn0) && !isnan(noise_bandwidth))
-    pprintw(w,row++,col,"SNR","%.1f dB   ",power2dB(sn0/noise_bandwidth));
-
-  if(!isnan(channel->output.gain))
-    pprintw(w,row++,col,"Gain","%.1lf dB   ",voltage2dB(channel->output.gain));
+  if(!isnan(Local.sn0))
+    pprintw(w,row++,col,"S/N₀","%.1f dBHz",power2dB(Local.sn0));
+  if(!isnan(Local.noise_bandwidth))
+    pprintw(w,row++,col,"NBW","%.1f dBHz",power2dB(Local.noise_bandwidth));
+  if(!isnan(Local.sn0) && !isnan(Local.noise_bandwidth))
+    pprintw(w,row++,col,"S/N","%.1f dB  ",power2dB(Local.sn0/Local.noise_bandwidth));
+  if(!isnan(channel->output.gain) && channel->demod_type == LINEAR_DEMOD) // Only relevant in linear
+    pprintw(w,row++,col,"Gain","%.1lf dB  ",voltage2dB(channel->output.gain));
   if(!isnan(channel->output.energy))
-    pprintw(w,row++,col,"Output","%.1lf dBFS ",power2dB(channel->output.energy)); // actually level; sender does averaging
-  if(!isnan(channel->output.headroom))
-    pprintw(w,row++,col,"Headroom","%.1f dBFS ",voltage2dB(channel->output.headroom));
+    pprintw(w,row++,col,"Output","%.1lf dBFS",power2dB(channel->output.energy)); // actually level; sender does averaging
   box(w,0,0);
   mvwaddstr(w,0,1,"Signal");
   wnoutrefresh(w);
@@ -1260,9 +1342,11 @@ static void display_demodulator(WINDOW *w,struct channel const *channel){
   switch(channel->demod_type){
   case FM_DEMOD:
   case WFM_DEMOD:
-    pprintw(w,row++,col,"Input SNR","%.1f dB",power2dB(channel->sig.snr));
-    pprintw(w,row++,col,"Squelch open","%.1f dB",power2dB(channel->fm.squelch_open));
-    pprintw(w,row++,col,"Squelch close","%.1f dB",power2dB(channel->fm.squelch_close));
+    pprintw(w,row++,col,"Input S/N","%.1f dB",power2dB(channel->sig.snr));
+    if(!isnan(channel->output.headroom))
+      pprintw(w,row++,col,"Headroom","%.1f dBFS ",voltage2dB(channel->output.headroom));
+    pprintw(w,row++,col,"Squel open","%.1f dB   ",power2dB(channel->fm.squelch_open)); // should move these
+    pprintw(w,row++,col,"Squel close","%.1f dB   ",power2dB(channel->fm.squelch_close));
     pprintw(w,row++,col,"Offset","%'+.3f Hz",channel->sig.foffset);
     pprintw(w,row++,col,"Deviation","%.1f Hz",channel->fm.pdeviation);
     if(!isnan(channel->fm.tone_freq) && channel->fm.tone_freq != 0)
@@ -1270,26 +1354,44 @@ static void display_demodulator(WINDOW *w,struct channel const *channel){
     if(!isnan(channel->fm.tone_deviation) && !isnan(channel->fm.tone_freq) && channel->fm.tone_freq != 0)
       pprintw(w,row++,col,"Tone dev","%.1f Hz",channel->fm.tone_deviation);
     if(channel->fm.rate != 0){
-      pprintw(w,row++,col,"Deemph tc","%.1f us",channel->fm.rate);
+      pprintw(w,row++,col,"Deemph τ","%.1f μs",channel->fm.rate);
       pprintw(w,row++,col,"Deemph gain","%.1f dB",channel->fm.gain);
     }
     break;
   case LINEAR_DEMOD:
+    if(!isnan(channel->output.headroom))
+      pprintw(w,row++,col,"Headroom","%.1f dBFS",voltage2dB(channel->output.headroom));
+    pprintw(w,row++,col,"Squel open","%.1f dB  ",power2dB(channel->fm.squelch_open)); // should move these
+    pprintw(w,row++,col,"Squel close","%.1f dB  ",power2dB(channel->fm.squelch_close));
+
     if(!isnan(channel->linear.threshold) && channel->linear.threshold > 0)
-      pprintw(w,row++,col,"Threshold","%.1f dB  ",voltage2dB(channel->linear.threshold));
+      pprintw(w,row++,col,"AGC Threshold","%.1f dB  ",voltage2dB(channel->linear.threshold));
     if(!isnan(channel->linear.recovery_rate) && channel->linear.recovery_rate > 0)
       pprintw(w,row++,col,"Recovery rate","%.1f dB/s",voltage2dB(channel->linear.recovery_rate));
     if(!isnan(channel->linear.hangtime))
       pprintw(w,row++,col,"Hang time","%.1f s   ",channel->linear.hangtime);
 
     if(channel->linear.pll){
-      pprintw(w,row++,col,"PLL BW","%.1f Hz  ",channel->linear.loop_bw);
-      pprintw(w,row++,col,"PLL SNR","%.1f dB  ",power2dB(channel->sig.snr));
-      pprintw(w,row++,col,"Offset","%'+.3f Hz  ",channel->sig.foffset);
-      pprintw(w,row++,col,"PLL Phase","%+.1f deg ",channel->linear.cphase*DEGPRA);
-      pprintw(w,row++,col,"PLL Lock","%s     ",channel->linear.pll_lock ? "Yes" : "No");
-      pprintw(w,row++,col,"Squelch open","%.1f dB  ",power2dB(channel->fm.squelch_open));
-      pprintw(w,row++,col,"Squelch close","%.1f dB  ",power2dB(channel->fm.squelch_close));
+      mvwhline(w,row,0,0,1000);
+      mvwaddstr(w,row++,1,"PLL");
+      mvwprintw(w,row++,col,"%-s",channel->linear.pll_lock ? "Lock" : "Unlock");
+      pprintw(w,row++,col,"BW","%.1f Hz",channel->linear.loop_bw);
+      pprintw(w,row++,col,"S/N","%.1f dB",power2dB(channel->sig.snr));
+      pprintw(w,row++,col,"Δf","%'+.3f Hz",channel->sig.foffset);
+      double phase = channel->linear.cphase * DEGPRA + 360 * channel->linear.rotations;
+
+      pprintw(w,row++,col,"φ","%+.1f °",channel->linear.cphase*DEGPRA);
+      if(Local.pll_start_time == 0){
+	Local.pll_start_time = gps_time_ns();
+	Local.pll_start_phase = phase;
+      }
+      double delta_t = 1e-9 * (gps_time_ns() - Local.pll_start_time);
+      double delta_ph = phase - Local.pll_start_phase;
+      pprintw(w,row++,col,"ΔT","%.1lf s ",delta_t);
+      pprintw(w,row++,col,"Δφ","%+.1f °",delta_ph);
+      pprintw(w,row++,col,"μ Δf/f","%g",delta_ph / (360 * delta_t * channel->tune.freq));
+    } else {
+      Local.pll_start_time = 0;
     }
     break;
   case SPECT_DEMOD:
@@ -1319,12 +1421,13 @@ static void display_input(WINDOW *w,struct channel const *channel){
   int col = 1;
   wmove(w,row,col);
   wclrtobot(w);
-  {
-    char tbuf[100];
-    pprintw(w,row++,col,"","%s",format_gpstime(tbuf,sizeof(tbuf),Frontend.timestamp));
-  }
-  pprintw(w,row++,col,"Samples","%'llu",Frontend.samples);
-  pprintw(w,row++,col,"Overrange","%'llu",Frontend.overranges);
+  char tmp[100];
+  pprintw(w,row++,col,"","%s",format_gpstime(tmp,sizeof(tmp),Frontend.timestamp));
+  if(Frontend.samprate != 0)
+    pprintw(w,row++,col,"Uptime","%s",ftime(tmp,sizeof(tmp),Frontend.samples/Frontend.samprate));
+  pprintw(w,row++,col,"Overranges","%'llu",Frontend.overranges);
+  if(Frontend.samprate != 0)
+    pprintw(w,row++,col,"Last overrange","%s",ftime(tmp,sizeof(tmp),Frontend.samp_since_over/Frontend.samprate));
   mvwhline(w,row,0,0,1000);
   mvwaddstr(w,row++,1,"Status");
   pprintw(w,row++,col,"","%s->%s",formatsock(&Metadata_source_socket),
@@ -1334,6 +1437,8 @@ static void display_input(WINDOW *w,struct channel const *channel){
   pprintw(w,row++,col,"Status pkts","%'llu",channel->status.packets_out);
   pprintw(w,row++,col,"Control pkts","%'llu",channel->status.packets_in);
   pprintw(w,row++,col,"Blocks since last poll","%'llu",channel->status.blocks_since_poll);
+  if(channel->options != 0)
+    pprintw(w,row++,col,"Options","0x%llx",(unsigned long long)channel->options);
   box(w,0,0);
   mvwaddstr(w,0,1,Frontend.description);
   wnoutrefresh(w);
@@ -1350,7 +1455,7 @@ static void display_output(WINDOW *w,struct channel const *channel){
   pprintw(w,row++,col,"","%s->%s",formatsock(&channel->output.source_socket),
 	  formatsock(&channel->output.dest_socket));
 
-  pprintw(w,row++,col,"SSRC","%'u",channel->output.rtp.ssrc);
+  pprintw(w,row++,col,"SSRC","%u",channel->output.rtp.ssrc);
   pprintw(w,row++,col,"Payload Type","%u",channel->output.rtp.type);
   pprintw(w,row++,col,"Encoding","%s",encoding_string(channel->output.encoding));
   pprintw(w,row++,col,"Channels","%d",channel->output.channels);
@@ -1369,7 +1474,8 @@ static void display_options(WINDOW *w,struct channel const *channel){
   int col = 1;
   wmove(w,row,col);
   wclrtobot(w);
-  if(channel->demod_type == FM_DEMOD){ // FM from status.h
+  switch(channel->demod_type){
+  case FM_DEMOD:
     if(!channel->fm.threshold)
       wattron(w,A_UNDERLINE);
     mvwaddstr(w,row++,col,"Th Ext off");
@@ -1379,8 +1485,8 @@ static void display_options(WINDOW *w,struct channel const *channel){
       wattron(w,A_UNDERLINE);
     mvwaddstr(w,row++,col,"Th Ext on");
     wattroff(w,A_UNDERLINE);
-
-  } else if(channel->demod_type == WFM_DEMOD){
+break;
+  case WFM_DEMOD:
     // Mono/stereo are only options
     if(channel->output.channels == 1)
       wattron(w,A_UNDERLINE);
@@ -1391,7 +1497,8 @@ static void display_options(WINDOW *w,struct channel const *channel){
       wattron(w,A_UNDERLINE);
     mvwaddstr(w,row++,col,"Stereo");
     wattroff(w,A_UNDERLINE);
-  } else if(channel->demod_type == LINEAR_DEMOD){
+    break;
+  case LINEAR_DEMOD:
     if(channel->linear.env && channel->output.channels == 1)
       wattron(w,A_UNDERLINE);
     mvwaddstr(w,row++,col,"Envelope");
@@ -1435,7 +1542,9 @@ static void display_options(WINDOW *w,struct channel const *channel){
       wattron(w,A_UNDERLINE);
     mvwaddstr(w,row++,col,"AGC On");
     wattroff(w,A_UNDERLINE);
-
+    break;
+  default:
+    break;
   }
   box(w,0,0);
   mvwaddstr(w,0,1,"Options");

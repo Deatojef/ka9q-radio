@@ -87,9 +87,9 @@ void *radio_status(void *arg){
 	    // Creation failed, e.g., no output stream
 	    fprintf(stdout,"Dynamic create of ssrc %'u failed; is 'data =' set in [global]?\n",ssrc);
 	  } else {
-	    chan->output.rtp.type = pt_from_info(chan->output.samprate,chan->output.channels); // make sure it's initialized
+	    chan->output.rtp.type = pt_from_info(chan->output.samprate,chan->output.channels,chan->output.encoding); // make sure it's initialized
 	    decode_radio_commands(chan,buffer+1,length-1);
-	    send_radio_status((struct sockaddr *)&Metadata_socket,&Frontend,chan); // Send status in response
+	    send_radio_status((struct sockaddr *)&Metadata_dest_socket,&Frontend,chan); // Send status in response
 	    reset_radio_status(chan);
 	    chan->status.global_timer = 0; // Just sent one
 	    start_demod(chan);
@@ -162,10 +162,13 @@ bool decode_radio_commands(struct channel *chan,uint8_t const *buffer,int length
       // Restart the demodulator to recalculate filters, etc
       {
 	int const new_sample_rate = round_samprate(decode_int(cp,optlen)); // Force to multiple of block rate
+	// If using Opus, ignore unsupported sample rates
 	if(new_sample_rate != chan->output.samprate){
-	  chan->output.samprate = new_sample_rate;
-	  chan->output.rtp.type = pt_from_info(chan->output.samprate,chan->output.channels);
-	  restart_needed = true;
+	  if(chan->output.encoding != OPUS || new_sample_rate == 48000 || new_sample_rate == 24000 || new_sample_rate == 16000 || new_sample_rate == 12000 || new_sample_rate == 8000){
+	    chan->output.samprate = new_sample_rate;
+	    chan->output.rtp.type = pt_from_info(chan->output.samprate,chan->output.channels,chan->output.encoding);
+	    restart_needed = true;
+	  }
 	}
       }
       break;
@@ -345,7 +348,7 @@ bool decode_radio_commands(struct channel *chan,uint8_t const *buffer,int length
 	int const i = decode_int(cp,optlen);
 	if(i != chan->output.channels && (i == 1 || i == 2)){
 	  chan->output.channels = i;
-	  chan->output.rtp.type = pt_from_info(chan->output.samprate,chan->output.channels);
+	  chan->output.rtp.type = pt_from_info(chan->output.samprate,chan->output.channels,chan->output.encoding);
 	}
       }
       break;
@@ -392,6 +395,47 @@ bool decode_radio_commands(struct channel *chan,uint8_t const *buffer,int length
 	  chan->status.output_interval = x;
       }
       break;
+    case OUTPUT_ENCODING:
+      {
+	enum encoding encoding = decode_int(cp,optlen);
+	if(encoding != chan->output.encoding && encoding >= NO_ENCODING && encoding < UNUSED_ENCODING){
+	  chan->output.encoding = encoding;
+	  // Opus can handle only a certain set of sample rates, and it operates at 48K internally
+	  if(encoding == OPUS && chan->output.samprate != 48000 && chan->output.samprate != 24000
+	     && chan->output.samprate != 16000 && chan->output.samprate != 12000 && chan->output.samprate != 8000){
+	    chan->output.samprate = 48000;
+	    restart_needed = true;
+	  }
+	  chan->output.rtp.type = pt_from_info(chan->output.samprate,chan->output.channels,chan->output.encoding);
+	}
+      }
+      break;
+    case SETOPTS:
+      {
+	uint64_t opts = decode_int64(cp,optlen);
+	chan->options |= opts;
+      }
+      break;
+    case CLEAROPTS:
+      {
+	uint64_t opts = decode_int64(cp,optlen);
+	chan->options &= ~opts;
+      }
+      break;
+    case RF_ATTEN:
+      {
+	float x = decode_float(cp,optlen);
+	if(!isnan(x) && Frontend.atten != NULL)
+	  (*Frontend.atten)(&Frontend,x);
+      }
+      break;
+    case RF_GAIN:
+      {
+	float x = decode_float(cp,optlen);
+	if(!isnan(x) && Frontend.gain != NULL)
+	  (*Frontend.gain)(&Frontend,x);
+      }
+      break;
     default:
       break;
     }
@@ -436,18 +480,16 @@ static int encode_radio_status(struct frontend const *frontend,struct channel co
   if(strlen(frontend->description) > 0)
     encode_string(&bp,DESCRIPTION,frontend->description,strlen(frontend->description));
 
-  // Echo timestamp from source or locally (bit of a kludge, eventually will always be local)
-  if(frontend->timestamp != 0)
-    encode_int64(&bp,GPS_TIME,frontend->timestamp);
-  else
-    encode_int64(&bp,GPS_TIME,gps_time_ns());
-
+  encode_socket(&bp,STATUS_DEST_SOCKET,&Metadata_dest_socket);
+  encode_int64(&bp,GPS_TIME,frontend->timestamp);
   encode_int64(&bp,INPUT_SAMPLES,frontend->samples);
   encode_int32(&bp,INPUT_SAMPRATE,frontend->samprate); // integer Hz
   encode_int32(&bp,FE_ISREAL,frontend->isreal ? true : false);
   encode_double(&bp,CALIBRATE,frontend->calibrate);
-  encode_double(&bp,RF_GAIN,frontend->rf_gain);
-  encode_double(&bp,RF_ATTEN,frontend->rf_atten);
+  encode_float(&bp,RF_GAIN,frontend->rf_gain);
+  encode_float(&bp,RF_ATTEN,frontend->rf_atten);
+  encode_float(&bp,RF_LEVEL_CAL,frontend->rf_level_cal);
+  encode_int(&bp,RF_AGC,frontend->rf_agc);
   encode_int32(&bp,LNA_GAIN,frontend->lna_gain);
   encode_int32(&bp,MIXER_GAIN,frontend->mixer_gain);
   encode_int32(&bp,IF_GAIN,frontend->if_gain);
@@ -467,15 +509,11 @@ static int encode_radio_status(struct frontend const *frontend,struct channel co
   // Adjust for A/D width
   // Level is absolute relative to A/D saturation, so +3dB for real vs complex
   if(chan->status.blocks_since_poll > 0){
-    float level = frontend->if_power;
-    level /= (1 << (frontend->bitspersample-1)) * (1 << (frontend->bitspersample-1));
-    // Scale real signals up 3 dB so a rail-to-rail sine will be 0 dBFS, not -3 dBFS
-    // Complex signals carry twice as much power, divided between I and Q
-    if(frontend->isreal)
-      level *= 2;
+    float level = frontend->if_power * scale_ADpower2FS(frontend);
     encode_float(&bp,IF_POWER,power2dB(level));
   }
   encode_int64(&bp,AD_OVER,frontend->overranges);
+  encode_int64(&bp,SAMPLES_SINCE_OVER,frontend->samp_since_over);
   encode_float(&bp,NOISE_DENSITY,power2dB(chan->sig.n0));
 
   // Modulation mode
@@ -495,6 +533,7 @@ static int encode_radio_status(struct frontend const *frontend,struct channel co
       encode_byte(&bp,PLL_SQUARE,chan->linear.square); //bool
       encode_float(&bp,PLL_PHASE,chan->linear.cphase); // radians
       encode_float(&bp,PLL_BW,chan->linear.loop_bw);   // hz
+      encode_int64(&bp,PLL_WRAPS,chan->linear.rotations); // count of complete 360-deg rotations of PLL phase
       // Relevant only when squelches are active
       encode_float(&bp,SQUELCH_OPEN,power2dB(chan->fm.squelch_open));
       encode_float(&bp,SQUELCH_CLOSE,power2dB(chan->fm.squelch_close));
@@ -570,7 +609,7 @@ static int encode_radio_status(struct frontend const *frontend,struct channel co
     encode_double(&bp,DOPPLER_FREQUENCY,chan->tune.doppler); // Hz
     encode_double(&bp,DOPPLER_FREQUENCY_RATE,chan->tune.doppler_rate); // Hz
     encode_int32(&bp,OUTPUT_CHANNELS,chan->output.channels);
-    if(!isnan(chan->sig.snr) && chan->sig.snr > 0)
+    if(!isnan(chan->sig.snr))
       encode_float(&bp,DEMOD_SNR,power2dB(chan->sig.snr)); // abs ratio -> dB
 
     // Source address we're using to send data
@@ -597,6 +636,7 @@ static int encode_radio_status(struct frontend const *frontend,struct channel co
   if(!isnan(chan->tp2))
     encode_float(&bp,TP2,chan->tp2);
   encode_int64(&bp,BLOCKS_SINCE_POLL,chan->status.blocks_since_poll);
+  encode_int64(&bp,SETOPTS,chan->options);
 
   encode_eol(&bp);
 

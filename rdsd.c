@@ -173,7 +173,7 @@ int main(int argc,char * const argv[]){
     snprintf(service_name,sizeof(service_name),"%s (%s)",Name,output);
     char description[1024];
     snprintf(description,sizeof(description),"pcm-source=%s",Input);
-    uint32_t addr = (239U << 24) | (ElfHashString(output) & 0xffffff);
+    uint32_t addr = make_maddr(output);
     avahi_start(service_name,"_rtp._udp",DEFAULT_RTP_PORT,output,addr,description,NULL,NULL);
 
     resolve_mcast(output,&Stereo_dest_address,DEFAULT_RTP_PORT,NULL,0);
@@ -415,7 +415,7 @@ void *decode(void *arg){
   int const pilot_rotate = quantum * round(19000./(hzperbin * quantum));
   int const subc_rotate = quantum * round(57000./(hzperbin * quantum));
 
-  int const payload_type = pt_from_info(Out_samprate,2);
+  int const payload_type = pt_from_info(Out_samprate,2,S16BE);
   if(payload_type < 0){
     fprintf(stderr,"Can't allocate RTP payload type for samprate = %'d, channels = %d\n",Out_samprate,2);
     exit(EX_SOFTWARE);
