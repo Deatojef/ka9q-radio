@@ -1,3 +1,4 @@
+#include <string.h>
 #include "radio.h"
 
 // Decode incoming status message from the radio program, convert and fill in fields in local channel structure
@@ -34,6 +35,9 @@ int decode_radio_status(struct frontend *frontend,struct channel *channel,uint8_
       FREE(frontend->description);
       frontend->description = decode_string(cp,optlen);
       break;
+    case STATUS_DEST_SOCKET:
+      decode_socket(&Metadata_dest_socket,cp,optlen);
+      break;
     case GPS_TIME:
       frontend->timestamp = decode_int64(cp,optlen);
       break;
@@ -45,6 +49,9 @@ int decode_radio_status(struct frontend *frontend,struct channel *channel,uint8_
       break;
     case AD_OVER:
       frontend->overranges = decode_int64(cp,optlen);
+      break;
+    case SAMPLES_SINCE_OVER:
+      frontend->samp_since_over = decode_int64(cp,optlen);
       break;
     case OUTPUT_DATA_SOURCE_SOCKET:
       decode_socket(&channel->output.source_socket,cp,optlen);
@@ -135,6 +142,9 @@ int decode_radio_status(struct frontend *frontend,struct channel *channel,uint8_
       break;
     case PLL_PHASE:
       channel->linear.cphase = decode_float(cp,optlen);
+      break;
+    case PLL_WRAPS:
+      channel->linear.rotations = (int64_t)decode_int64(cp,optlen);
       break;
     case ENVELOPE:
       channel->linear.env = decode_bool(cp,optlen);
@@ -231,11 +241,17 @@ int decode_radio_status(struct frontend *frontend,struct channel *channel,uint8_
       break;
     case BIN_DATA:
       break;
+    case RF_AGC:
+      frontend->rf_agc = decode_int(cp,optlen);
+      break;
     case RF_GAIN:
       frontend->rf_gain = decode_float(cp,optlen);
       break;
     case RF_ATTEN:
       frontend->rf_atten = decode_float(cp,optlen);
+      break;
+    case RF_LEVEL_CAL:
+      frontend->rf_level_cal = decode_float(cp,optlen);
       break;
     case BLOCKS_SINCE_POLL:
       channel->status.blocks_since_poll = decode_int64(cp,optlen);
@@ -255,6 +271,9 @@ int decode_radio_status(struct frontend *frontend,struct channel *channel,uint8_
       break;
     case STATUS_INTERVAL:
       channel->status.output_interval = decode_int(cp,optlen);
+      break;
+    case SETOPTS:
+      channel->options = decode_int64(cp,optlen);
       break;
     default: // ignore others
       break;

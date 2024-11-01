@@ -244,7 +244,10 @@ int close_chan(struct channel *chan){
   FREE(chan->filter.energies);
   FREE(chan->spectrum.bin_data);
   delete_filter_output(&chan->filter.out);
-
+  if(chan->output.opus != NULL){
+    opus_encoder_destroy(chan->output.opus);
+    chan->output.opus = NULL;
+  }
   pthread_mutex_unlock(&chan->status.lock);
   pthread_mutex_lock(&Channel_list_mutex);
   if(chan->inuse){
@@ -314,9 +317,9 @@ double set_first_LO(struct channel const * const chan,double const first_LO){
     return first_LO;
 
   // Direct tuning through local module if available
-  if(Frontend.tune != NULL){
+  if(Frontend.tune != NULL)
     return (*Frontend.tune)(&Frontend,first_LO);
-  }
+
   return first_LO;
 }
 
@@ -458,7 +461,7 @@ void *sap_send(void *p){
 
     len = snprintf(wp,space,"a=rtpmap:%d %s/%d/%d\r\n",
 		   chan->output.rtp.type,
-		   PT_table[chan->output.rtp.type].encoding == OPUS ? "Opus" : "L16",
+		   encoding_string(chan->output.encoding),
 		   chan->output.samprate,
 		   chan->output.channels);
     wp += len;
@@ -502,10 +505,14 @@ int downconvert(struct channel *chan){
     // Process any commands and return status
     bool restart_needed = false;
     pthread_mutex_lock(&chan->status.lock);
+
+    if(chan->status.output_interval != 0 && chan->status.output_timer == 0 && !chan->output.silent)
+      chan->status.output_timer = 1; // channel has become active, send update on this pass
+
     // Look on the single-entry command queue and grab it atomically
     if(chan->status.command != NULL){
       restart_needed = decode_radio_commands(chan,chan->status.command,chan->status.length);
-      send_radio_status((struct sockaddr *)&Metadata_socket,&Frontend,chan); // Send status in response
+      send_radio_status((struct sockaddr *)&Metadata_dest_socket,&Frontend,chan); // Send status in response
       chan->status.global_timer = 0; // Just sent one
       // Also send to output stream
       send_radio_status((struct sockaddr *)&chan->status.dest_socket,&Frontend,chan);
@@ -514,15 +521,20 @@ int downconvert(struct channel *chan){
       reset_radio_status(chan); // After both are sent
     } else if(chan->status.global_timer != 0 && --chan->status.global_timer <= 0){
       // Delayed status request, used mainly by all-channel polls to avoid big bursts
-      send_radio_status((struct sockaddr *)&Metadata_socket,&Frontend,chan); // Send status in response
+      send_radio_status((struct sockaddr *)&Metadata_dest_socket,&Frontend,chan); // Send status in response
       chan->status.global_timer = 0; // to make sure
-      reset_radio_status(chan); // After both are sent
-    } else if(!chan->output.silent && chan->status.output_interval != 0 && chan->status.output_timer-- <= 0){
-      // Send status on output channel
-      send_radio_status((struct sockaddr *)&chan->status.dest_socket,&Frontend,chan);
-      chan->status.output_timer = chan->status.output_interval; // Reload
-      reset_radio_status(chan); // After both are sent
+      reset_radio_status(chan);
+    } else if(chan->status.output_interval != 0 && chan->status.output_timer > 0){
+      // Timer is running for status on output stream
+      if(--chan->status.output_timer == 0){
+	// Timer has expired; send status on output channel
+	send_radio_status((struct sockaddr *)&chan->status.dest_socket,&Frontend,chan);
+	reset_radio_status(chan);
+	if(!chan->output.silent)
+	  chan->status.output_timer = chan->status.output_interval; // Restart timer only if channel is active
+      }
     }
+
     pthread_mutex_unlock(&chan->status.lock);
     if(restart_needed){
       if(Verbose > 1)
@@ -545,6 +557,7 @@ int downconvert(struct channel *chan){
     // No front end coverage of our carrier; wait one block time for it to retune
     chan->sig.bb_power = 0;
     chan->sig.bb_energy = 0;
+    chan->sig.snr = 0;
     chan->output.energy = 0;
     struct timespec timeout; // Needed to avoid deadlock if no front end is available
     clock_gettime(CLOCK_REALTIME,&timeout);
@@ -583,12 +596,11 @@ int downconvert(struct channel *chan){
   }
   execute_filter_output(&chan->filter.out,-shift); // block until new data frame
   chan->status.blocks_since_poll++;
-  float level_normalize = scale_voltage_out2FS(&Frontend);
   if(buffer != NULL){ // No output time-domain buffer in spectral analysis mode
     const int N = chan->filter.out.olen; // Number of raw samples in filter output buffer
     float energy = 0;
     for(int n=0; n < N; n++){
-      buffer[n] *= level_normalize * step_osc(&chan->fine);
+      buffer[n] *= step_osc(&chan->fine);
       energy += cnrmf(buffer[n]);
     }
     energy /= N;
@@ -605,37 +617,27 @@ int downconvert(struct channel *chan){
   float maxpower = (1 << (Frontend.bitspersample - 1));
   maxpower *= maxpower * 0.5; // 0 dBFS
   if(Frontend.if_power < maxpower)
-    chan->sig.n0 = scale_power_out2FS(&Frontend) * estimate_noise(chan,-shift); // Negative, just like compute_tuning. Note: must follow execute_filter_output()
+    chan->sig.n0 = estimate_noise(chan,-shift); // Negative, just like compute_tuning. Note: must follow execute_filter_output()
   return 0;
 }
 
-// Return multiplicative factor for converting A/D samples to full scale (FS) prior to filtering
-// Unlike the corresponding function scale_voltage_out2FS(), this is not corrected for front end gain since we're interested in keeping the A/D converter happy
-float scale_ADvoltage2FS(struct frontend const *frontend){
+// scale A/D output to full scale for monitoring overloads
+float scale_ADpower2FS(struct frontend const *frontend){
+  assert(frontend->bitspersample > 0);
   float scale = 1.0f / (1 << (frontend->bitspersample - 1)); // Important to force the numerator to float, otherwise the divide produces zero!
+  scale *= scale;
   // Scale real signals up 3 dB so a rail-to-rail sine will be 0 dBFS, not -3 dBFS
   // Complex signals carry twice as much power, divided between I and Q
   if(frontend->isreal)
-    scale *= M_SQRT2;
+    scale *= 2;
   return scale;
 }
-// scale_ADvoltage() squared, for RMS power measurements (sums of voltages squared)
-float scale_ADpower2FS(struct frontend const *frontend){
-  float scale = scale_ADvoltage2FS(frontend);
-  return scale * scale;
-
-}
-// Corresponding functions for baseband signals AFTER filter
-// Returns multiplicative factor for converting raw floats to dBFS
-// Scales for bits per sample AND compensates for front end analog gain
+// Returns multiplicative factor for converting raw samples to floats with analog gain correction
 // Real vs complex difference is (I think) handled in the filter with a 3dB boost, so there's no sqrt(2) correction here
-float scale_voltage_out2FS(struct frontend *frontend){
+float scale_AD(struct frontend const *frontend){
+  assert(frontend->bitspersample > 0);
   float scale = 1.0f / (1 << (frontend->bitspersample - 1));
-  float analog_gain = frontend->rf_gain - frontend->rf_atten; // net analog gain, dB
+  // net analog gain, dBm to dBFS, that we correct for to maintain unity gain, i.e., 0 dBm -> 0 dBFS
+  float analog_gain = frontend->rf_gain - frontend->rf_atten + frontend->rf_level_cal; 
   return scale * dB2voltage(-analog_gain); // Front end gain as amplitude ratio
-}
-
-float scale_power_out2FS(struct frontend *frontend){
-  float scale = scale_voltage_out2FS(frontend);
-  return scale * scale;
 }

@@ -35,7 +35,7 @@ void dump_metadata(FILE *fp,uint8_t const * const buffer,int length,bool newline
     }
     if(cp - buffer + optlen >= length)
       break; // Invalid length
-    fprintf(fp,"%s(%d) ",newline? "\n":" ",type); fflush(stdout); // DEBUG
+    fprintf(fp,"%s[%d] ",newline? "\n":" ",type);
     switch(type){
     case EOL: // Shouldn't get here
       goto done;
@@ -60,6 +60,13 @@ void dump_metadata(FILE *fp,uint8_t const * const buffer,int length,bool newline
 	fprintf(fp,"%s",d);
 	FREE(d);
       }
+      break;
+    case STATUS_DEST_SOCKET:
+      {
+	struct sockaddr_storage sock;
+	fprintf(fp,"status dest %s",formatsock(decode_socket(&sock,cp,optlen)));
+      }
+      break;
       break;
     case INPUT_SAMPRATE:
       fprintf(fp,"in samprate %'llu Hz",(long long unsigned)decode_int64(cp,optlen));
@@ -95,7 +102,10 @@ void dump_metadata(FILE *fp,uint8_t const * const buffer,int length,bool newline
       fprintf(fp,"data pkts %'llu",(long long unsigned)decode_int64(cp,optlen));
       break;
     case AD_OVER:
-      fprintf(fp,"A/D overrange: %llu",(long long unsigned)decode_int64(cp,optlen));
+      fprintf(fp,"A/D overrange: %'llu",(long long unsigned)decode_int64(cp,optlen));
+      break;
+    case SAMPLES_SINCE_OVER:
+      fprintf(fp,"Samples since A/D overrange: %'llu",(long long unsigned)decode_int64(cp,optlen));
       break;
     case CALIBRATE:
       fprintf(fp,"calibration %'lg",decode_double(cp,optlen));
@@ -222,6 +232,9 @@ void dump_metadata(FILE *fp,uint8_t const * const buffer,int length,bool newline
     case PLL_BW:
       fprintf(fp,"PLL loop BW %'.1f Hz",decode_float(cp,optlen));
       break;
+    case PLL_WRAPS:
+      fprintf(fp,"PLL phase wraps %'lld",(long long)decode_int64(cp,optlen));
+      break;
     case ENVELOPE:
       fprintf(fp,"Env det %s",decode_int8(cp,optlen) ? "on" : "off");
       break;
@@ -241,7 +254,7 @@ void dump_metadata(FILE *fp,uint8_t const * const buffer,int length,bool newline
       fprintf(fp,"PL tone deviation %'g Hz",decode_float(cp,optlen));
       break;
     case AGC_ENABLE:
-      fprintf(fp,"agc %s",decode_int8(cp,optlen) ? "enable" : "disable");
+      fprintf(fp,"channel agc %s",decode_int8(cp,optlen) ? "enable" : "disable");
       break;
     case HEADROOM:
       fprintf(fp,"headroom %.1f dB",decode_float(cp,optlen));
@@ -319,6 +332,12 @@ void dump_metadata(FILE *fp,uint8_t const * const buffer,int length,bool newline
     case RF_GAIN:
       fprintf(fp,"rf gain %.1f dB",decode_float(cp,optlen));
       break;
+    case RF_LEVEL_CAL:
+      fprintf(fp,"rf level cal %.1f dB",decode_float(cp,optlen));
+      break;
+    case RF_AGC:
+      fprintf(fp,"rf agc %s",decode_int(cp,optlen) ? "enabled" : "disabled");
+      break;
     case BIN_DATA:
       {
 	fprintf(fp,"fft bins:");
@@ -339,6 +358,18 @@ void dump_metadata(FILE *fp,uint8_t const * const buffer,int length,bool newline
       {
 	int e = decode_int(cp,optlen);
 	fprintf(fp,"encoding %d (%s)",e,encoding_string(e));
+      }
+      break;
+    case SETOPTS:
+      {
+	uint64_t opts = decode_int64(cp,optlen);
+	fprintf(fp,"setopts 0x%llx",(unsigned long long)opts);
+      }
+      break;
+    case CLEAROPTS:
+      {
+	uint64_t opts = decode_int64(cp,optlen);
+	fprintf(fp,"clearopts 0x%llx",(unsigned long long)opts);
       }
       break;
     default:

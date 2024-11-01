@@ -30,6 +30,7 @@
 #include <sched.h>
 #include <sysexits.h>
 #include <fcntl.h>
+#include <strings.h>
 
 #include "misc.h"
 #include "multicast.h"
@@ -46,7 +47,7 @@ static int const DEFAULT_IP_TOS = 48; // AF12 left shifted 2 bits
 static int const DEFAULT_MCAST_TTL = 0; // Don't blast LANs with cheap Wifi!
 static float const DEFAULT_BLOCKTIME = 20.0;
 static int const DEFAULT_OVERLAP = 5;
-static int const DEFAULT_UPDATE = 50; // 1 Hz for 20 ms blocktime (50 Hz frame rate)
+static int const DEFAULT_UPDATE = 25; // 2 Hz for 20 ms blocktime (50 Hz frame rate)
 static int const DEFAULT_LIFETIME = 20; // 20 sec for idle sessions tuned to 0 Hz
 
 char const *Iface;
@@ -81,8 +82,8 @@ volatile bool Stop_transfers = false; // Request to stop data transfers; how sho
 
 static int64_t Starttime;      // System clock at timestamp 0, for RTCP
 static pthread_t Status_thread;
-struct sockaddr_storage Metadata_socket;      // Dest of global metadata
-static char const *Metadata_string; // DNS name of default multicast group for status/commands
+struct sockaddr_storage Metadata_dest_socket;      // Dest of global metadata
+static char const *Metadata_dest_string; // DNS name of default multicast group for status/commands
 int Output_fd = -1; // Unconnected socket used for all multicast output
 
 static void closedown(int);
@@ -100,6 +101,8 @@ double sdrplay_tune(struct frontend *,double);
 int rx888_setup(struct frontend *,dictionary *,char const *);
 int rx888_startup(struct frontend *);
 double rx888_tune(struct frontend *,double);
+float rx888_gain(struct frontend *, float);
+float rx888_atten(struct frontend *,float);
 
 // In airspy.c
 int airspy_setup(struct frontend *,dictionary *,char const *);
@@ -313,7 +316,7 @@ static int loadconfig(char const * const file){
     snprintf(ttlmsg,sizeof(ttlmsg),"TTL=%d",Mcast_ttl);
 
     int slen = sizeof(Template.output.dest_socket);
-    uint32_t addr = (239U << 24) | (ElfHashString(Data) & 0xffffff); // Force into site-local multicast space
+    uint32_t addr = make_maddr(Data);
     avahi_start(Name,"_rtp._udp",DEFAULT_RTP_PORT,Data,addr,ttlmsg,&Template.output.dest_socket,&slen);
 #if 0
     avahi_start(Name,"_ka9q-ctl._udp",DEFAULT_STAT_PORT,Data,addr,ttlmsg,&Template.status.dest_socket,&slen); // same length
@@ -385,22 +388,21 @@ static int loadconfig(char const * const file){
       *cp = '\0';
     char default_status[strlen(hostname) + strlen(Name) + 20]; // Enough room for snprintf
     snprintf(default_status,sizeof(default_status),"%s-%s.local",hostname,Name);
-    Metadata_string = strdup(config_getstring(Configtable,global,"status",default_status)); // Status/command target for all demodulators
+    Metadata_dest_string = strdup(config_getstring(Configtable,global,"status",default_status)); // Status/command target for all demodulators
   }
   {
     char ttlmsg[100];
     snprintf(ttlmsg,sizeof(ttlmsg),"TTL=%d",Mcast_ttl);
-    int slen = sizeof(Metadata_socket);
-    uint32_t addr = ElfHashString(Metadata_string);
-    addr = (239U << 24) | (addr & 0xffffff); // Force into site-local multicast space
-    avahi_start(Frontend.description != NULL ? Frontend.description : Name,"_ka9q-ctl._udp",DEFAULT_STAT_PORT,Metadata_string,addr,ttlmsg,&Metadata_socket,&slen);
+    int slen = sizeof(Metadata_dest_socket);
+    uint32_t addr = make_maddr(Metadata_dest_string);
+    avahi_start(Frontend.description != NULL ? Frontend.description : Name,"_ka9q-ctl._udp",DEFAULT_STAT_PORT,Metadata_dest_string,addr,ttlmsg,&Metadata_dest_socket,&slen);
   }
-  // avahi_start has resolved the target DNS name into Metadata_socket and inserted the port number
-  join_group(Output_fd,(struct sockaddr *)&Metadata_socket,Iface,Mcast_ttl,IP_tos);
+  // avahi_start has resolved the target DNS name into Metadata_dest_socket and inserted the port number
+  join_group(Output_fd,(struct sockaddr *)&Metadata_dest_socket,Iface,Mcast_ttl,IP_tos);
   // Same remote socket as status
-  Ctl_fd = listen_mcast(&Metadata_socket,Iface);
+  Ctl_fd = listen_mcast(&Metadata_dest_socket,Iface);
   if(Ctl_fd < 0){
-    fprintf(stdout,"can't listen for commands from %s: %s\n",Metadata_string,strerror(errno));
+    fprintf(stdout,"can't listen for commands from %s: %s\n",Metadata_dest_string,strerror(errno));
     exit(EX_NOHOST);
   }
 
@@ -456,7 +458,7 @@ static int loadconfig(char const * const file){
       snprintf(ttlmsg,sizeof(ttlmsg),"TTL=%d",Mcast_ttl);
 
       int slen = sizeof(data_dest_socket);
-      uint32_t addr = (239U << 24) | (ElfHashString(data) & 0xffffff); // Force into site-local multicast space
+      uint32_t addr = make_maddr(data);
       avahi_start(sname,"_rtp._udp",DEFAULT_RTP_PORT,data,addr,ttlmsg,&data_dest_socket,&slen);
 #if 0
       avahi_start(sname,"_ka9q-ctl._udp",DEFAULT_STAT_PORT,data,addr,ttlmsg,&metadata_dest_socket,&slen); // sockets are same size
@@ -541,7 +543,7 @@ static int loadconfig(char const * const file){
 	strlcpy(chan->output.dest_string,data,sizeof(chan->output.dest_string));
 	memcpy(&chan->status.dest_socket,&metadata_dest_socket,sizeof(chan->status.dest_socket));
 
-	chan->output.rtp.type = pt_from_info(chan->output.samprate,chan->output.channels);
+	chan->output.rtp.type = pt_from_info(chan->output.samprate,chan->output.channels,chan->output.encoding);
 	chan->status.output_interval = update;
 
 	// Time to start it -- ssrc is stashed by create_chan()
@@ -605,7 +607,9 @@ static int setup_hardware(char const *sname){
   if(strcasecmp(device,"rx888") == 0){
     Frontend.setup = rx888_setup;
     Frontend.start = rx888_startup;
-    Frontend.tune = NULL; // Only direct sampling for now
+    Frontend.tune = rx888_tune;
+    Frontend.gain = rx888_gain;
+    Frontend.atten = rx888_atten;
   } else if(strcasecmp(device,"airspy") == 0){
     Frontend.setup = airspy_setup;
     Frontend.start = airspy_startup;

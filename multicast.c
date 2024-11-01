@@ -166,6 +166,7 @@ struct pt_table PT_table[128] = {
 { 0, 0, 0 }, // 127
 };
 
+
 #define AX25_PT (96)  // NON-standard payload type for my raw AX.25 frames - clean this up and remove
 #define OPUS_PT (111) // Hard-coded NON-standard payload type for OPUS (should be dynamic with sdp)
 
@@ -177,6 +178,14 @@ int const AX25_pt = AX25_PT;
 // The mappings are typically extracted from a radiod status channel and kept in a table so they can
 // be changed midstream without losing anything
 int add_pt(int type, int samprate, int channels, enum encoding encoding){
+  if(encoding == NO_ENCODING)
+    return -1;
+
+  if(encoding == OPUS){
+    // Force Opus to fixed values
+    samprate = 48000;
+    channels = 2;
+  }
   if(type >= 0 && type < 128){
     PT_table[type].channels = channels;
     PT_table[type].samprate = samprate;
@@ -298,21 +307,10 @@ int listen_mcast(void const *s,char const *iface){
     perror("setup_mcast socket");
     return -1;
   }
-  switch(sock->sa_family){
-  case AF_INET:
-    set_ipv4_options(fd,-1,-1);
-    if(ipv4_join_group(fd,sock,iface) != 0)
-     fprintf(stderr,"join_group failed\n");
-    break;
-  case AF_INET6:
-    set_ipv6_options(fd,-1,-1);
-    if(ipv6_join_group(fd,sock,iface) != 0)
-     fprintf(stderr,"join_group failed\n");
-    break;
-  default:
+  if(join_group(fd,sock,iface,-1,-1) == -1){
+    close(fd);
     return -1;
   }
-
   if((bind(fd,sock,sizeof(struct sockaddr)) != 0)){
     perror("listen mcast bind");
     close(fd);
@@ -597,25 +595,29 @@ enum encoding encoding_from_pt(int const type){
     return NO_ENCODING;
   return PT_table[type].encoding;
 }
-
-
 // Dynamically create a new one if not found
 // Should lock the table when it's modified
-// Should add encoding to this parameter list
-int pt_from_info(int const samprate,int const channels){
-  if(samprate <= 0 || channels <= 0 || channels > 2)
+// Use for sending only! Receivers need to build a table for each sender
+int pt_from_info(int samprate,int channels,enum encoding encoding){
+  if(samprate <= 0 || channels <= 0 || channels > 2 || encoding == NO_ENCODING || encoding >= UNUSED_ENCODING)
     return -1;
 
-  // Search table for existing entry, otherwise create new entry
-  for(int type=0; type < 128; type++)
-    if(PT_table[type].samprate == samprate && PT_table[type].channels == channels)
-      return type;
+  if(encoding == OPUS){
+    // Force Opus to fixed values
+    channels = 2;
+    samprate = 48000;
+  }
 
-  for(int type=96; type < 128; type++){ // Dynamic range
+  // Search table for existing entry, otherwise create new entry
+  for(int type=0; type < 128; type++){
+    if(PT_table[type].samprate == samprate && PT_table[type].channels == channels && PT_table[type].encoding == encoding)
+      return type;
+  }
+  for(int type=96; type < 128; type++){ // Allocate a new type in the dynamic range
     if(PT_table[type].samprate == 0){
       // allocate it
-      PT_table[type].samprate = samprate;
-      PT_table[type].channels = channels;
+      if(add_pt(type,samprate,channels,encoding) == -1)
+	return -1;
       return type;
     }
   }
@@ -950,14 +952,48 @@ char const *encoding_string(enum encoding e){
   case NO_ENCODING:
     return "none";
   case S16LE:
-    return "signed 16-bit little endian";
+    return "s16le";
   case S16BE:
-    return "signed 16-bit big endian";    
+    return "s16be";
   case OPUS:
-    return "Opus";
-  case F32:
-    return "32 bit floating point";
+    return "opus";
+  case F32LE:
+    return "f32le";
   case AX25:
-    return "AX.25";
+    return "ax.25";
+  case F16LE:
+    return "f16le";
   }
+}
+enum encoding parse_encoding(char const *str){
+  if(strcasecmp(str,"s16be") == 0 || strcasecmp(str,"s16") == 0 || strcasecmp(str,"int") == 0)
+    return S16BE;
+  else if(strcasecmp(str,"s16le") == 0)
+    return S16LE;
+  else if(strcasecmp(str,"f32") == 0 || strcasecmp(str,"float") == 0 || strcasecmp(str,"f32le") == 0)
+    return F32LE;
+  else if(strcasecmp(str,"f16") == 0 || strcasecmp(str,"f16le") == 0)
+    return F16LE;
+  else if(strcasecmp(str,"opus") == 0)
+    return OPUS;
+  else if(strcasecmp(str,"ax25") == 0 || strcasecmp(str,"ax.25") == 0)
+    return AX25;
+  else
+    return NO_ENCODING;
+}
+// Generate a multicast address in the 239.0.0.0/8 administratively scoped block
+// avoiding 239.0.0.0/24 and 239.128.0.0/24 since these map at the link layer
+// into the same Ethernet multicast MAC addresses as the 224.0.0.0/8 multicast control block
+// that is not snooped by switches
+uint32_t make_maddr(char const *arg){
+  //  uint32_t addr = (239U << 24) | (ElfHashString(arg) & 0xffffff); // poor performance when last byte is always the same (.)
+  uint32_t addr = (239U << 24) | (fnv1hash((uint8_t *)arg,strlen(arg)) & 0xffffff);
+  // avoid 239.0.0.0/24 and 239.128.0.0/24 since they map to the same
+  // Ethernet multicast MAC addresses as 224.0.0.0/24, the internet control block
+  // This increases the risk of collision slightly (512 out of 16 M)
+  if((addr & 0x007fff00) == 0)
+    addr |= (addr & 0xff) << 8;
+  if((addr & 0x007fff00) == 0)
+    addr |= 0x00100000; // Small chance of this for a random address
+  return addr;
 }

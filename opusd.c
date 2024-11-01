@@ -65,10 +65,6 @@ struct session {
   struct rtp_state rtp_state_out; // RTP output state
 
   unsigned long underruns;  // Callback count of underruns (stereo samples) replaced with silence
-  float deemph_rate;
-  float deemph_gain;
-  float deemph_state_left;
-  float deemph_state_right;
   uint64_t packets;
 };
 
@@ -80,21 +76,14 @@ int Mcast_ttl = 1;
 int IP_tos = 48;              // AF12 << 2
 const char *App_path;
 int Verbose;                  // Verbosity flag (currently unused)
-int Opus_bitrate = 32;        // Opus stream audio bandwidth; default 32 kb/s
+int Opus_bitrate = 32000;        // Opus stream audio bandwidth; default 32 kb/s
 bool Discontinuous = false;        // Off by default
 int Opus_blocktime = 20;      // Minimum frame size 20 ms, a reasonable default
 bool Fec_enable = false;                  // Use forward error correction
 int Application = OPUS_APPLICATION_AUDIO; // Encoder optimization mode
-const float Corner_freq = 300; // Hz - corner frequency in de-emphasis integrator
-const float LF_gain = 4;       // == 12 dB; empirical to make equal subjective voice loudness with flat FM
-                               // Will make PL tone louder by this amount until we implement a filter
 const float Latency = 0.02;    // chunk size for audio output callback
 
 // Global variables
-pthread_t Status_thread;
-pthread_mutex_t Input_ready_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t Input_ready_cond = PTHREAD_COND_INITIALIZER;
-
 int Status_fd = -1;           // Reading from radio status
 int Input_fd = -1;            // Multicast receive socket
 int Output_fd = -1;           // Multicast receive socket
@@ -250,7 +239,7 @@ int main(int argc,char * const argv[]){
     char description[1024];
     snprintf(description,sizeof(description),"pcm-source=%s",Input); // what if it changes?
     int socksize = sizeof(Opus_out_socket);
-    uint32_t addr = (239U << 24) | (ElfHashString(Output) & 0xffffff);
+    uint32_t addr = make_maddr(Output);
     avahi_start(Name,"_opus._udp",DEFAULT_RTP_PORT,Output,addr,description,&Opus_out_socket,&socksize);
     struct sockaddr_in *sin = (struct sockaddr_in *)&Metadata_out_socket;
     sin->sin_family = AF_INET;
