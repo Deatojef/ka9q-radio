@@ -308,7 +308,7 @@ int main(int argc,char *argv[])
     }
 
     // check the callsign
-    if(igate_configuration.callsign == NULL) {
+    if(strlen(igate_configuration.callsign) == 0) {
         fprintf(stderr,"Must specify a callsign for to use as the user when igating to APRS-IS.\n");
         exit(EX_USAGE);
     }
@@ -480,7 +480,7 @@ int main(int argc,char *argv[])
         // Set up multicast input
         {
             struct sockaddr_storage sock;
-            resolve_mcast(Mcast_address_text,&sock,DEFAULT_RTP_PORT,NULL,0);
+            resolve_mcast(Mcast_address_text, &sock, DEFAULT_RTP_PORT, NULL, 0, 0);
             Input_fd = listen_mcast(&sock,NULL);
         }
         if (Input_fd == -1) {
@@ -578,7 +578,7 @@ int main(int argc,char *argv[])
                     // if TCPIP, RFONLY, or NOGATE appears, this frame should not be igated
                     if (strcmp(frame.digipeaters[i].name,"TCPIP") == 0 || strcmp(frame.digipeaters[i].name, "RFONLY") == 0 || strcmp(frame.digipeaters[i].name, "NOGATE") == 0)
                         is_rfonly = 1;
-                    else if (strcmp(frame.digipeaters[i].name, "ARISS") == 0) 
+                    else if (strcmp(frame.digipeaters[i].name, "ARISS") == 0 || rtp_header.ssrc == 145825)
                         is_satellite = 1;
                     
                     int const w = snprintf(cp,sspace,",%s%s",frame.digipeaters[i].name,frame.digipeaters[i].h ? "*" : "");
