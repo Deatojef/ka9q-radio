@@ -91,7 +91,7 @@ int main(int argc,char *argv[]){
   {
     struct sockaddr_storage sock;
     printf("Resolving multicast address: %s\n", Mcast_address_text);
-    resolve_mcast(Mcast_address_text,&sock,DEFAULT_RTP_PORT,NULL,0);
+    resolve_mcast(Mcast_address_text, &sock, DEFAULT_RTP_PORT, NULL, 0, 0);
     printf("Creating network socket\n");
     Input_fd = listen_mcast(&sock,NULL);
   }
