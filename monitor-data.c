@@ -61,7 +61,7 @@ void *dataproc(void *arg){
   {
     char iface[1024];
     struct sockaddr sock;
-    resolve_mcast(mcast_address_text,&sock,DEFAULT_RTP_PORT,iface,sizeof(iface));
+    resolve_mcast(mcast_address_text,&sock,DEFAULT_RTP_PORT,iface,sizeof(iface),0);
     input_fd = listen_mcast(&sock,iface);
   }
   if(input_fd == -1)
@@ -345,8 +345,10 @@ void *decode_task(void *arg){
 	assert(bounce == NULL); // detect possible memory leaks
 	bounce = malloc(bounce_size);
 	int const samples = opus_decode_float(sp->opus,pkt->data,pkt->len,bounce,bounce_size,0);
-	if(samples != sp->frame_size)
+	if(samples != sp->frame_size){
 	  fprintf(stderr,"samples %d frame-size %d\n",samples,sp->frame_size);
+	  goto endloop;
+	}
       }
       break;
     case S16LE:
