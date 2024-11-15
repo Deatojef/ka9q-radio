@@ -30,6 +30,7 @@
 #include <poll.h>
 #include <gps.h>
 #include <cjson/cJSON.h>
+#include <libmemcached/memcached.h>
 
 #include "multicast.h"
 #include "ax25.h"
@@ -65,7 +66,7 @@ typedef struct {
     int dropped;  // number of packets dropped (i.e. not sent to APRS-IS) for one reason or another
     int received;  // number of received (over RF...err..technical from packetd) packets
     int satellite;  // number of packets received from satellites (mostly on 145.825MHz)
-    int direct;  // number of packets we've heard direction (i.e. not digipeated)
+    int direct;  // number of packets we've heard directly (i.e. not digipeated)
 } PACKET_STATISTICS;
 
 // this igate configuration
@@ -77,6 +78,9 @@ typedef struct {
     // GPSD hostname
     char gpsdhost[128];
     bool gpsdenabled;
+
+    // save packets heard to memcached?
+    bool usememcache;  // default to NOT using memcached
 
     // AX25 multicast hostname
     char ax25host[128];
@@ -179,6 +183,7 @@ void closedown(int x);
 int readtelemseq(char *filename);
 void writetelemseq(char *filename, int seq);
 void processJSONObject(cJSON *json);
+int passcode(char *call, char *buffer, size_t n_buffer);
 void checkForConfigurable(cJSON *item);
 void initlocation(LOCATION *loc);
 void initpacketstatistics(PACKET_STATISTICS *stats);
@@ -241,6 +246,7 @@ int main(int argc,char *argv[])
     // --------------------- start: read configuration file ------------------
     //
 
+    // initialize global structures
     initigateconfig(&igate_configuration);
     initlocation(&location);
     initpacketstatistics(&aprs_statistics);
@@ -303,29 +309,14 @@ int main(int argc,char *argv[])
 
     // check the callsign
     if(igate_configuration.callsign == NULL) {
-        fprintf(stderr,"Must specify a callsign for to use as the user when igating to APRS-IS:  -u User\n");
+        fprintf(stderr,"Must specify a callsign for to use as the user when igating to APRS-IS.\n");
         exit(EX_USAGE);
     }
 
 
     // if no APRS-IS passcode was supplied, then determine it on the fly
     if(strlen(igate_configuration.passcode) == 0) {
-        // Calculate trivial hash authenticator
-        int hash = 0x73e2;
-        char callsign[16];
-        strlcpy(callsign,igate_configuration.callsign,sizeof(callsign));
-        char *cp;
-        if((cp = strchr(callsign,'-')) != NULL)
-            *cp = '\0';
-
-        int const len = strlen(callsign);
-
-        for(int i=0; i<len; i += 2) {
-            hash ^= toupper(callsign[i]) << 8;
-            hash ^= toupper(callsign[i+1]);
-        }
-        hash &= 0x7fff;
-        if(snprintf(igate_configuration.passcode, sizeof(igate_configuration.passcode), "%d",hash) <= 0) {
+        if (passcode(igate_configuration.callsign, igate_configuration.passcode, sizeof(igate_configuration.passcode) <= 0)) {
             fprintf(stderr,"Unexpected error in computing passcode\n");
             exit(EX_SOFTWARE);
         }
@@ -510,7 +501,7 @@ int main(int argc,char *argv[])
             // wait for 50ms for new data to appear on the input socket (i.e. the multicast RTP stream)
             poll(pollfd, 1, 50);
 
-            // if there was data available then read it it.
+            // if there was data available then read it.
             if(pollfd[0].revents & POLLIN) {
                 // there *should* be data available on the socket, soooo, this shouldn't block.
                 size = recv(Input_fd, packet, sizeof(packet), 0);
@@ -542,7 +533,6 @@ int main(int argc,char *argv[])
             // print the start of a log message.  this includes timestamp, etc..but no newline...as that'll be written down below...
             // Emit local timestamp
             char result[1024];
-
             fprintf(igate_configuration.logfile,"%s ssrc %u seq %d",
                     format_gpstime(result,sizeof(result),gps_time_ns()),
                     rtp_header.ssrc,rtp_header.seq);
@@ -743,7 +733,7 @@ int main(int argc,char *argv[])
 
 // ---------------------------------------------------------------------
 // ---------------------------------------------------------------------
-// Just read and echo responses from the APRS-IS server
+// THREAD:  Just read and echo responses from the APRS-IS server
 void *netreader(void *arg)
 {
     pthread_setname("aprs-read");
@@ -918,9 +908,25 @@ int telemetrypacket(char *buffer, size_t n, APRS_EQNS *eqns)
     // unlock the stats mutex
     pthread_mutex_unlock(&stats_lock);
 
-    // calculate the % dropped and direct
-    pct_dropped = (int) round(100.0 * (double) dropped / (double) received);
-    pct_direct = (int)round(100.0 * (double) heard_direct / (double) received);
+    // calculate the % dropped and direct if there were packets we received over the interval
+    if (received > 0) {
+
+        // calculate the percentages
+        pct_dropped = (int) round(100.0 * (double) dropped / (double) received);
+        pct_direct = (int)round(100.0 * (double) heard_direct / (double) received);
+
+        // sanity check if the percentages are < 0, then just set to zero
+        if (pct_dropped < 0)
+            pct_dropped = 0.0;
+        if (pct_direct < 0)
+            pct_direct = 0.0;
+    }
+    else {
+        // no received packets we just set the percentages to 0
+        pct_dropped = 0;
+        pct_direct = 0;
+    }
+
 
     // Determine coefficients for the APRS equations packet.  We do this because telemetry values can only range from 0-255.
     adjusted_receive = calculatecoef(received, &(eqns->rx));
@@ -954,7 +960,7 @@ int telemetrypacket(char *buffer, size_t n, APRS_EQNS *eqns)
 
 // ---------------------------------------------------------------------
 // ---------------------------------------------------------------------
-// for a given set of station details, fill a buffer with the constructed information string (as part of an APRS packet)
+// for a given set of station details, fill a buffer with the constructed information string (for use as part of an APRS packet)
 int createinfostring(char *buffer, size_t n, LOCATION *station)
 {
     float local_lat, local_lon, lat_ms, lon_ms;
@@ -1133,7 +1139,7 @@ int bitspacket(char *buffer, size_t n)
 
 // ---------------------------------------------------------------------
 // ---------------------------------------------------------------------
-// send a position packet to the APRS-IS server
+// THREAD:  send a position packet to the APRS-IS server
 void *beaconthread(void *arg)
 {
     pthread_setname("beacon-thread");
@@ -1323,7 +1329,9 @@ void *beaconthread(void *arg)
 }
 
 
-// the GPS thread
+// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// THREAD:  read from GPSD out posotion and populate global location structure.  Only used if gpsdenabled was set to true in the JSON configuration file.
 void *gpsthread(void *arg)
 {
     pthread_setname("gps-thread");
@@ -1420,6 +1428,8 @@ void *gpsthread(void *arg)
 }
 
 
+// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
 // This will parse the given JSON element array/object and look for configuration settings.  This is recursive.
 void processJSONObject(cJSON *json) {
     int jsize = cJSON_GetArraySize(json);
@@ -1449,6 +1459,8 @@ void processJSONObject(cJSON *json) {
 }
 
 
+// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
 // check the JSON item for a configuration item
 void checkForConfigurable(cJSON *item) {
     if (cJSON_IsInvalid(item))
@@ -1478,6 +1490,8 @@ void checkForConfigurable(cJSON *item) {
         strncpy(igate_configuration.gpsdhost, item->valuestring, sizeof(igate_configuration.gpsdhost)-1);
     else if (strcmp(item->string, "gpsdenabled") == 0) 
         igate_configuration.gpsdenabled = (cJSON_IsTrue(item) ? true : false);
+    else if (strcmp(item->string, "usememcache") == 0) 
+        igate_configuration.usememcache = (cJSON_IsTrue(item) ? true : false);
     else if (strcmp(item->string, "symbol") == 0)
         strncpy(igate_configuration.symbol, item->valuestring, sizeof(igate_configuration.symbol)-1);
     else if (strcmp(item->string, "overlay") == 0)
@@ -1491,6 +1505,8 @@ void checkForConfigurable(cJSON *item) {
 }
 
 
+// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
 // initialize location structure
 void initlocation(LOCATION *loc) {
     loc->lat = 0.0;
@@ -1502,6 +1518,8 @@ void initlocation(LOCATION *loc) {
 }
 
 
+// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
 // initialize packet statistics structure
 void initpacketstatistics(PACKET_STATISTICS *stats) {
     stats->dropped = 0;
@@ -1510,11 +1528,15 @@ void initpacketstatistics(PACKET_STATISTICS *stats) {
     stats->direct = 0;
 }
 
+
+// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
 // initialize igate configuration structure
 void initigateconfig(IGATE_CONFIGURATION *config) {
     config->ismobile = false;
     memset(config->gpsdhost, 0, sizeof(config->gpsdhost));
     config->gpsdenabled = false;
+    config->usememcache = false;
     snprintf(config->ax25host, sizeof(config->ax25host), "ax25.local");
     snprintf(config->aprsishost, sizeof(config->aprsishost), "noam.aprs2.net");
     snprintf(config->aprsisport, sizeof(config->aprsisport), "14580");
@@ -1534,3 +1556,35 @@ void initigateconfig(IGATE_CONFIGURATION *config) {
 
 
 
+// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// determine the APRS passcode for a given callsign.  returns 0 if there was a failure, otherwise return the number of characters copied to the buffer.
+int passcode(char *call, char *buffer, size_t n_buffer) {
+
+    // Calculate trivial hash authenticator
+    int hash = 0x73e2;
+    char callsign[16]; // limit the callsign characters we'll look at to only 16 chars.  Shouldn't be an issue as ham callsigns are limited to 8 chars (i.e. AB0DEF-99).
+    char *cp;
+
+    // make a copy of the incoming callsign, 'call', and save that into a local array for manipulation - so we don't muck with the original.
+    strlcpy(callsign, call, sizeof(callsign));
+
+    // find the hyphen in the callsign string...if found, replace that character with a \0.
+    if((cp = strchr(callsign,'-')) != NULL)
+        *cp = '\0';
+
+    // how long is the callsign (without the extra hyphen and ssid)
+    int const len = strlen(callsign);
+
+    // loop through each character in the callsign, computing the running hash of each character
+    for(int i=0; i<len; i += 2) {
+        hash ^= toupper(callsign[i]) << 8;
+        hash ^= toupper(callsign[i+1]);
+    }
+
+    // mask off only first couple of bytes (but not the most signficant bit)
+    hash &= 0x7fff;
+
+    // save the resulting passcode to the buffer
+    return snprintf(buffer, n_buffer, "%d", hash);
+}
