@@ -682,7 +682,7 @@ int main(int argc,char *argv[])
 
                 continue;
             }
-            if (is_satellite && heard_direct) {
+            if (is_satellite && heard_direct && strcmp(frame.source, "RS0ISS") != 0) {
                 fprintf(igate_configuration.logfile," %s -- Not relaying: satellite packet heard directly\n", monstring);
                 continue;
             }
