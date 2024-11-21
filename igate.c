@@ -40,9 +40,9 @@
 // structures for APRS telemetry data and station particulars
 // ---------------------------------------------------------------------
 typedef struct {
-    int a;
-    int b;
-    int c;
+    double a;
+    double b;
+    double c;
 } APRS_COEF;
 
 typedef struct {
@@ -176,7 +176,7 @@ int bitspacket(char *buffer, size_t n);
 int unitspacket(char *buffer, size_t n);
 int parampacket(char *buffer, size_t n);
 int eqnpacket(char *buffer, size_t n, APRS_EQNS *eqns);
-int calculatecoef(int value, APRS_COEF *c);
+int calculatecoef(double value, APRS_COEF *c);
 int telemetrypacket(char *buffer, size_t n, APRS_EQNS *eqns);
 int createinfostring(char *buffer, size_t n, LOCATION *station);
 void closedown(int x);
@@ -578,7 +578,7 @@ int main(int argc,char *argv[])
                     // if TCPIP, RFONLY, or NOGATE appears, this frame should not be igated
                     if (strcmp(frame.digipeaters[i].name,"TCPIP") == 0 || strcmp(frame.digipeaters[i].name, "RFONLY") == 0 || strcmp(frame.digipeaters[i].name, "NOGATE") == 0)
                         is_rfonly = 1;
-                    else if (strcmp(frame.digipeaters[i].name, "ARISS") == 0 || rtp_header.ssrc == 145825)
+                    else if (strcmp(frame.digipeaters[i].name, "ARISS") == 0 || strcmp(frame.digipeaters[i].name, "RS0ISS") == 0 || rtp_header.ssrc == 145825)
                         is_satellite = 1;
                     
                     int const w = snprintf(cp,sspace,",%s%s",frame.digipeaters[i].name,frame.digipeaters[i].h ? "*" : "");
@@ -885,8 +885,8 @@ int telemetrypacket(char *buffer, size_t n, APRS_EQNS *eqns)
     int adjusted_dropped;
     int adjusted_receive_sat;
     int adjusted_direct;
-    int pct_dropped;
-    int pct_direct;
+    double pct_dropped;
+    double pct_direct;
 
     // sanity check
     if (buffer == NULL)
@@ -912,8 +912,8 @@ int telemetrypacket(char *buffer, size_t n, APRS_EQNS *eqns)
     if (received > 0) {
 
         // calculate the percentages
-        pct_dropped = (int) round(100.0 * (double) dropped / (double) received);
-        pct_direct = (int)round(100.0 * (double) heard_direct / (double) received);
+        pct_dropped = 100.0 * (double) dropped / (double) received;
+        pct_direct = 100.0 * (double) heard_direct / (double) received;
 
         // sanity check if the percentages are < 0, then just set to zero
         if (pct_dropped < 0)
@@ -923,8 +923,8 @@ int telemetrypacket(char *buffer, size_t n, APRS_EQNS *eqns)
     }
     else {
         // no received packets we just set the percentages to 0
-        pct_dropped = 0;
-        pct_direct = 0;
+        pct_dropped = 0.0;
+        pct_direct = 0.0;
     }
 
 
@@ -1064,20 +1064,57 @@ int createinfostring(char *buffer, size_t n, LOCATION *station)
 // ---------------------------------------------------------------------
 // ---------------------------------------------------------------------
 // calculate the APRS coefficients for the equations packet of the "value" parameter
-int calculatecoef(int value, APRS_COEF *c) 
-{
-    int adjusted_value = value;
+int calculatecoef(double value, APRS_COEF *c) {
+    int adjusted_value;
+    double one_million = 1000000.0; // used for rounding coefficient values to 6 digits.
 
-    if (value <= 255) {
+    // if the value is between -255 and +255 then we forego using the "a" coefficient
+    if (value >= -255 && value <= 255) {
+        adjusted_value = (value >= 0 ? (int) floor(value) : (int) ceil(value));
         c->a = 0;
         c->b = 1;
-        c->c = 0;
+        c->c = round((value - adjusted_value) * one_million) / one_million;
     }
-    else {
-        c->a = 0;
-        c->b = value / 255;
-        c->c = value % 255;
-        adjusted_value = 255;
+    else { // the value was < -255 or > +255...
+
+        // just picking some base value for x
+        adjusted_value = 128;
+
+        // our calculated coefficient values and some remainder placeholders
+        int A, B;
+        double C, A_remainder, B_remainder;
+
+        // if the value is positive
+        if (value > 0) {
+            // a coefficient (just making this an integer)
+            A = (int) floor(value / (adjusted_value * adjusted_value));
+            A_remainder = value - A*adjusted_value*adjusted_value;
+
+            // b coefficient (just making this an integer)
+            B = (int) floor(A_remainder / (adjusted_value));
+            B_remainder = A_remainder - B*adjusted_value;
+
+            // c coefficient...everything left over.  ;)
+            C = B_remainder;
+        }
+        else { // if the value is negative
+
+            // a coefficient (just making this an integer)
+            A = (int) ceil(value / (adjusted_value * adjusted_value));
+            A_remainder = value - A*adjusted_value*adjusted_value;
+
+            // b coefficient (just making this an integer)
+            B = (int) ceil(A_remainder / (adjusted_value));
+            B_remainder = A_remainder - B*adjusted_value;
+
+            // c coefficient...everything left over.  ;)
+            C = B_remainder;
+        }
+
+        // round these to 6 digits.
+        c->a = round(A * one_million) / one_million;
+        c->b = round(B * one_million) / one_million;
+        c->c = round(C * one_million) / one_million;
     }
 
     return adjusted_value;
@@ -1091,7 +1128,8 @@ int eqnpacket(char *buffer, size_t n, APRS_EQNS *eqns)
     if (buffer == NULL)
         return 0;
 
-    return snprintf(buffer, n, "%s>%s,TCPIP*::%-9s:EQNS.%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,0,0,0", 
+    //return snprintf(buffer, n, "%s>%s,TCPIP*::%-9s:EQNS.%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,0,0,0", 
+    return snprintf(buffer, n, "%s>%s,TCPIP*::%-9s:EQNS.%g,%g,%g,%g,%g,%g,%g,%g,%g,%g,%g,%g,0,0,0", 
             igate_configuration.callsign, tocall, igate_configuration.callsign, 
             eqns->rx.a, eqns->rx.b, eqns->rx.c, 
             eqns->rxsat.a, eqns->rxsat.b, eqns->rxsat.c, 
