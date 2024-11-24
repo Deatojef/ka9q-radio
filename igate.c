@@ -575,7 +575,11 @@ int main(int argc,char *argv[])
                     // if TCPIP, RFONLY, or NOGATE appears, this frame should not be igated
                     if (strcmp(frame.digipeaters[i].name,"TCPIP") == 0 || strcmp(frame.digipeaters[i].name, "RFONLY") == 0 || strcmp(frame.digipeaters[i].name, "NOGATE") == 0)
                         is_rfonly = 1;
-                    else if (strcmp(frame.digipeaters[i].name, "ARISS") == 0 || strcmp(frame.digipeaters[i].name, "RS0ISS") == 0 || rtp_header.ssrc == 145825)
+                    else if (strcmp(frame.digipeaters[i].name, "ARISS") == 0 
+                            || strcmp(frame.digipeaters[i].name, "RS0ISS") == 0 
+                            || strcmp(frame.digipeaters[i].name, "DP0SNX") == 0 
+                            || strcmp(frame.digipeaters[i].name, "A55BTN") == 0
+                            || rtp_header.ssrc == 145825)
                         is_satellite = 1;
                     
                     int const w = snprintf(cp,sspace,",%s%s",frame.digipeaters[i].name,frame.digipeaters[i].h ? "*" : "");
@@ -676,7 +680,11 @@ int main(int argc,char *argv[])
 
                 continue;
             }
-            if (is_satellite && heard_direct && strcmp(frame.source, "RS0ISS") != 0) {
+            if (is_satellite 
+                    && heard_direct 
+                    && strcmp(frame.source, "RS0ISS") != 0 
+                    && strcmp(frame.source, "DP0SNX") != 0 
+                    && strcmp(frame.source, "A55BTN") != 0) {
                 logmessage(igate_configuration.logfile,"ssrc %u seq %d direct %d %s -- Not relaying: satellite packet heard directly.", rtp_header.ssrc, rtp_header.seq, heard_direct, monstring);
                 continue;
             }
