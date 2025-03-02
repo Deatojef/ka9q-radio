@@ -220,7 +220,7 @@ int main(int argc,char *argv[])
 
     // This is the status RTP address (ex. 2m.local, 70cm.local)
     char iface[1024]; // Multicast interface
-    resolve_mcast(Status_hostname, &Metadata_dest_address, DEFAULT_STAT_PORT, iface, sizeof(iface));
+    resolve_mcast(Status_hostname, &Metadata_dest_address, DEFAULT_STAT_PORT, iface, sizeof(iface), 0);
     Status_fd = listen_mcast(&Metadata_dest_address, iface);
     
     // If unable to connect to the status multicast address then exit
@@ -398,7 +398,7 @@ ssrcitem_t *parse_int_string(const char *str, int *num_elements)
 //  remove a specific character from a string, placing the result in the 'dest' string.
 void rmch(char *source, char c, char *dest, size_t dest_size)
 {
-    int i;
+    long unsigned int i;
 
     // loop through each char in the source
     for (i = 0; *source != 0 && i < dest_size; source++, i++) {
@@ -415,20 +415,21 @@ void rmch(char *source, char c, char *dest, size_t dest_size)
 }
 
 // Initialize a new, unused channel instance where fields start non-zero
-static int init_demod(struct channel *channel)
-{
-    memset(channel,0,sizeof(*channel));
-    channel->tune.second_LO = NAN;
-    channel->tune.freq = channel->tune.shift = NAN;
-    channel->filter.min_IF = channel->filter.max_IF = channel->filter.kaiser_beta = NAN;
-    channel->output.headroom = channel->linear.hangtime = channel->linear.recovery_rate = NAN;
-    channel->sig.bb_power = channel->sig.snr = channel->sig.foffset = NAN;
-    channel->fm.pdeviation = channel->linear.cphase = channel->linear.lock_timer = NAN;
-    channel->output.gain = NAN;
-    channel->tp1 = channel->tp2 = NAN;
-    //channel->output.data_fd = channel->output.rtcp_fd = -1;
-    return 0;
+static int init_demod(struct channel *channel){
+  if(channel == NULL)
+    return -1;
+  memset(channel,0,sizeof(*channel));
+  channel->tune.second_LO = NAN;
+  channel->tune.freq = channel->tune.shift = NAN;
+  channel->filter.min_IF = channel->filter.max_IF = channel->filter.kaiser_beta = NAN;
+  channel->output.headroom = channel->linear.hangtime = channel->linear.recovery_rate = NAN;
+  channel->sig.bb_power = channel->sig.snr = channel->sig.foffset = NAN;
+  channel->fm.pdeviation = channel->pll.cphase = NAN;
+  channel->output.gain = NAN;
+  channel->tp1 = channel->tp2 = NAN;
+  return 0;
 }
+
 
 // Is response for us (1), or for somebody else (-1)?
 //static int for_us(struct channel *channel,uint8_t const *buffer,int length,uint32_t ssrc)

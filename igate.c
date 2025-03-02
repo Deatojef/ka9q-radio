@@ -38,6 +38,7 @@
 
 #include "multicast.h"
 #include "ax25.h"
+#include "rtp.h"
 
 
 // log message formatter, not called directly...used by macros (below) 
@@ -139,7 +140,7 @@ char *Logfilename;
 char *Configfilename = "/etc/radio/igate.json";
 
 // max packet size for position packets (actually the max size is 256 - 70 = 186, but backing this off by 8 bytes for a little buffer room)
-static int MAX_POSIT = 178;
+static long unsigned int MAX_POSIT = 178;
 
 // APRS tocall value.  Experimental tocalls start with APZxxx.  Using "KR1" for "KA9Q-Radio 1".  Dunno...just making this up.  ;)
 char *tocall = "APZKR1";
@@ -606,7 +607,7 @@ int main(int argc,char *argv[])
                     sspace--;
                     assert(sspace > 0);
                 }
-                for(int i=0; i < frame.info_len; i++) {
+                for(long unsigned int i=0; i < frame.info_len; i++) {
                     char const c = frame.information[i] & 0x7f; // Strip parity in monitor strings
                     if(c != '\r' && c != '\n' && c != '\0') {
                         // Strip newlines, returns and nulls (we'll add a cr-lf later)
