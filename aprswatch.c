@@ -25,6 +25,7 @@
 #include "multicast.h"
 #include "ax25.h"
 #include "misc.h"
+#include "rtp.h"
 
 char *Mcast_address_text = "ax25.local";
 char *Host = "noam.aprs2.net";
@@ -170,7 +171,7 @@ int main(int argc,char *argv[]){
 	  *cp++ = ':'; sspace--;
 	  assert(sspace > 0);
 	}      
-	for(int i=0; i < frame.info_len; i++){
+	for(long unsigned int i=0; i < frame.info_len; i++){
 	  char const c = frame.information[i] & 0x7f; // Strip parity in monitor strings
 	  if(c != '\r' && c != '\n' && c != '\0'){
 	    // Strip newlines, returns and nulls (we'll add a cr-lf later)

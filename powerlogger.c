@@ -46,6 +46,7 @@
 static int const DEFAULT_IP_TOS = 48;
 static int const DEFAULT_MCAST_TTL = 1; // LAN only, no routers
 struct sockaddr_storage Metadata_dest_address;      // Dest of metadata (typically multicast)
+struct sockaddr Metadata_dest_socket;      // Dest of metadata (typically multicast)
 int Mcast_ttl = DEFAULT_MCAST_TTL;
 int IP_tos = DEFAULT_IP_TOS;
 int Ctl_fd;

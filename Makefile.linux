@@ -142,10 +142,10 @@ control: control.o libradio.a
 aprswatch: aprswatch.o libradio.a
 	$(CC) $(LDOPTS) -o $@ $^ -lbsd -lm -lpthread
 
-igate: igate.o ax25.o libradio.a
+igate: igate.o libradio.a
 	$(CC) $(LDOPTS) -o $@ $^ -lbsd -lm -lpthread -lgps -lcjson -lmemcached
 
-powerlogger: powerlogger.o libradio.a db.o 
+powerlogger: powerlogger.o db.o libradio.a 
 	$(CC) $(LDOPTS) -o $@ $^ -lbsd -lm -lpthread -lgps -lpq
 
 cwd: cwd.o libradio.a
