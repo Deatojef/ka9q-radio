@@ -38,6 +38,7 @@
 
 #include "multicast.h"
 #include "ax25.h"
+#include "igate.h"
 
 
 // log message formatter, not called directly...used by macros (below) 
@@ -558,6 +559,8 @@ int main(int argc,char *argv[])
             int is_rfonly = 0;
 
 
+            //***************************** THREAD:  should be processing thread below ***********************
+
             // ------------------- start:  process the incoming packet ---------------
             {
                 memset(monstring,0,sizeof(monstring));
@@ -690,6 +693,69 @@ int main(int argc,char *argv[])
             }
 
             // ------------------- end:  check for drop conditions ---------------
+            
+            //***************************** THREAD:  should be processing thread above ***********************
+            
+           
+            
+           
+            //
+            // if the above processing is within another thread, then how do we know when to kill this inner loop and restrart stuff?
+            //
+            // Move all aprs.net connectivity to the "igating" thread so all of that is self contained?  ...and we're not trying to communicate to the APRS-IS cloud
+            // within 'main'?
+            //
+            // Threads/process list:
+            // * gpsd  (just updates a global position structure??)
+            //   - loops:
+            //     + connects to GPSD
+            //     + reads position every second (or whenever data is available)
+            //     + updates global position structure 
+            //
+            // * Producer:  incoming frame processing  
+            //   - loops:
+            //     + this reads from ax25.local
+            //     + creates valid ax.25 frame
+            //     + parses valid ax.25 frames into APRS text
+            //     + places valid APRS text on a queue
+            //
+            // * Consumer:  APRS-IS operations
+            //   - loops:
+            //     + reads packet from queue (no need to lock as just reading)
+            //     + attempts to get a mutex_lock on the queue entry and drements the consumer count by 1
+            //       - if that decrement causes the count to now be 0, then run the function that deletes the queue entry
+            //     + sends packets to aprs.net (if passes criteria)
+            //     + sends keep-alives to aprs.net connection
+            //     + beacons telemetry (calculates statistics) 
+            //     + beacons position 
+            //
+            // * Consumer:  database operations
+            //   - loops:
+            //     + reads packet from queue (no need to lock as just reading)
+            //     + attempts to get a mutex_lock on the queue entry and drements the consumer count by 1
+            //       - if that decrement causes the count to now be 0, then run the function that deletes the queue entry
+            //     + Parses APRS packet into structure
+            //     + loops through db connections:
+            //       - sends to database memcache
+            //       - sends to databse postgresql
+            //       - sends to database sqlite
+            //
+            // note:  maybe just have a queue entry checker function that runs within the Consumer loop.  It checks if the consumer count is 0, and if so, deletes the queue entry.  
+            //        I mean, one of the consumers must be the "last" one to run and get a lock on the queue entry and therefore should be in a position to delete the queue entry.
+            //        Question is, when to run this lock/decrement/check?  Run is moments after reading the queue entry?  Or wait until done with processing of the data?  Probably should
+            //        just run the lock/decrement/check function immediately after reading the queue entry as being quick to free up queue slots is the lesser evil compared to a very small delay
+            //        in processing the data entry.  
+            //
+            //        This probably would work for low numbers of consumers, but if the number is larger (ex. 4+??  dunno), then the amount of time each would wait will go up.
+            //
+            // * (is this needed if using the lock/decrement/check function within the consumers??)  Garbage collector:  clean up queue
+            //   - loops:
+            //     + looks at queue entries 
+            //     + checks if each one has been "consumed" by all downstream consumers (usage counter is at zero??)
+            //     + if "consumed", then delete entry from queue  (how to do this and maintain queue structure?)
+            //     + only looks at the "consuming" end of the queue.  
+            //
+            
 
             // if the packet wasn't dropped (above) then log the message
             logmessage(igate_configuration.logfile,"ssrc %u seq %d direct %d %s", rtp_header.ssrc, rtp_header.seq, heard_direct, monstring);
