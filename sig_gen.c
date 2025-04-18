@@ -22,6 +22,11 @@
 #include "config.h"
 #include "radio.h"
 
+#define INPUT_PRIORITY 95
+static int const Random_samples = 30000000;
+static float Power_smooth = 0.05; // Calculate this properly someday
+
+
 enum modulation {
   CW = 0, // No modulation
   DSB, // AM without a carrier
@@ -37,6 +42,7 @@ struct sdrstate {
   float noise; // Amplitude of noise
   enum modulation modulation;
   char *source;
+  float scale;
 
   pthread_t proc_thread;
 };
@@ -48,15 +54,12 @@ struct sdrstate {
 static int Blocksize;
 extern bool Stop_transfers;
 
-static int const Random_samples = 30000000;
-static float Power_smooth = 0.05; // Calculate this properly someday
-
 // One second of noise in requested format
 // Will be played with a random starting point every block
-complex float *Complex_noise;
+float complex *Complex_noise;
 float *Real_noise;
 
-static complex float complex_gaussian(void);
+static float complex complex_gaussian(void);
 static float real_gaussian(void);
 
 double sig_gen_tune(struct frontend * const frontend,double const freq);
@@ -173,9 +176,7 @@ static void *proc_sig_gen(void *arg){
   assert(frontend != NULL);
   
   frontend->timestamp = gps_time_ns();
-  float scale = 1 << (frontend->bitspersample-1);
-
-  realtime();
+  realtime(INPUT_PRIORITY);
 
   struct osc carrier;
   memset(&carrier,0,sizeof(carrier));
@@ -245,13 +246,13 @@ static void *proc_sig_gen(void *arg){
 	}
 	if(Real_noise != NULL)
 	  wptr[i] += Real_noise[noise_index+i];
-	wptr [i] *= scale;
 	if_energy += wptr[i] * wptr[i];
+	wptr [i] *= sdr->scale;
       }
       write_rfilter(&frontend->in,NULL,blocksize); // Update write pointer, invoke FFT      
     } else {
       // Complex signal
-      complex float * wptr = frontend->in.input_write_pointer.c;
+      float complex * wptr = frontend->in.input_write_pointer.c;
       for(int i=0; i < blocksize; i++){
 	wptr[i] = sdr->amplitude * step_osc(&carrier);
 	switch(sdr->modulation){
@@ -281,8 +282,8 @@ static void *proc_sig_gen(void *arg){
 	}
 	if(Complex_noise != NULL)
 	  wptr[i] += Complex_noise[noise_index+i];
-	wptr [i] *= scale;
 	if_energy += cnrmf(wptr[i]);
+	wptr [i] *= sdr->scale;
       }
       write_cfilter(&frontend->in,NULL,blocksize); // Update write pointer, invoke FFT      
     }
@@ -308,6 +309,7 @@ int sig_gen_startup(struct frontend *frontend){
   assert(sdr != NULL);
 
   // Start processing A/D data
+  sdr->scale = scale_AD(frontend);
   pthread_create(&sdr->proc_thread,NULL,proc_sig_gen,sdr);
   fprintf(stdout,"signal generator running\n");
   return 0;
@@ -326,8 +328,8 @@ double sig_gen_tune(struct frontend * const frontend,double const freq){
 #if 0
 // Marsaglia polar method for generating gaussian RVs
 // Slow on modern machines because of random branch and pipeline stalls
-static complex float complex_gaussian(void){
-  complex float result;
+static float complex complex_gaussian(void){
+  float complex result;
   float u,v,s;
   do {
     // range -1, +1
@@ -343,13 +345,13 @@ static complex float complex_gaussian(void){
 #else
 // Box-Mueller method that avoids rejection
 // Seems faster on i7 despite sincos call
-static complex float expif(float x){
+static float complex expif(float x){
   float s = sin(x);
   float c = cos(x);
   return c + I*s;
 }
 
-static complex float complex_gaussian(void){
+static float complex complex_gaussian(void){
   // RVs uniformly distributed over (0,1)
 #if 0
   float u = (float)arc4random() / (float)UINT32_MAX;
@@ -372,7 +374,7 @@ static float real_gaussian(void){
     got_saved = false;
     return saved;
   }
-  complex float r = complex_gaussian();
+  float complex r = complex_gaussian();
   got_saved = true;
   saved = __imag__ r;
   return __real__ r;

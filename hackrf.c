@@ -24,13 +24,22 @@
 #include "misc.h"
 #include "config.h"
 
+// Configurable parameters
+#define INPUT_PRIORITY 95
+// decibel limits for power
+static float const Upper_limit = -15;
+static float const Lower_limit = -25;
+static int Default_samprate = 5000000;
+static float const DC_alpha = 1.0e-7;  // high pass filter coefficient for DC offset estimates, per sample
+static float const Power_alpha= 1.0; // time constant (seconds) for smoothing power and I/Q imbalance estimates
+
 struct sdrstate {
   struct frontend *frontend;  // Avoid references to external globals
   hackrf_device *device;
   int clips;                // Sample clips since last reset
 
   // Smoothed error estimates
-  complex float DC;      // DC offset
+  float complex DC;      // DC offset
   float sinphi;          // I/Q phase error
   float imbalance;       // Ratio of I power to Q power
   // Gain and phase corrections. These will be updated every block
@@ -49,13 +58,6 @@ struct sdrstate {
 };
 
 
-// Configurable parameters
-// decibel limits for power
-static float const Upper_limit = -15;
-static float const Lower_limit = -25;
-static int Default_samprate = 5000000;
-static float const DC_alpha = 1.0e-7;  // high pass filter coefficient for DC offset estimates, per sample
-static float const Power_alpha= 1.0; // time constant (seconds) for smoothing power and I/Q imbalance estimates
 
 static char const *HackRF_keys[] = {
   "library",
@@ -239,6 +241,7 @@ int hackrf_startup(struct frontend * const frontend){
   struct sdrstate *sdr = frontend->context;
   //  pthread_create(&Process_thread,NULL,hackrf_proc,sdr);
 
+  sdr->scale = scale_AD(frontend);
   int ret = hackrf_start_rx(sdr->device,rx_callback,sdr);
   assert(ret == HACKRF_SUCCESS);
   (void)ret;
@@ -260,18 +263,19 @@ static int rx_callback(hackrf_transfer *transfer){
   if(!Name_set){
     pthread_setname("hackrf-cb");
     Name_set = true;
-    realtime();
+    realtime(INPUT_PRIORITY);
+    stick_core();
   }
   int remain = transfer->valid_length; // Count of individual samples; divide by 2 to get complex samples
   int sampcount = remain / 2;            // Complex samples
   uint8_t *dp = transfer->buffer;
 
-  complex float samp_sum = 0;
+  float complex samp_sum = 0;
   float i_energy=0,q_energy=0;
   float dotprod = 0;                           // sum of I*Q, for phase balance
   float rate_factor = 1./(frontend->samprate * Power_alpha);
 
-  complex float * const wptr = frontend->in.input_write_pointer.c;
+  float complex * const wptr = frontend->in.input_write_pointer.c;
   for(int i=0; i < sampcount; i++){
 
     int isamp_i = (int8_t)*dp++;
@@ -285,7 +289,7 @@ static int rx_callback(hackrf_transfer *transfer){
       sdr->clips++;
       isamp_i = -127;
     }
-    complex float samp = CMPLXF(isamp_i,isamp_q);
+    float complex samp = CMPLXF(isamp_i,isamp_q);
     samp_sum += samp;
 
     // remove DC offset (which can be fractional)

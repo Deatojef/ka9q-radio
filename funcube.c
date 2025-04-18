@@ -18,34 +18,9 @@
 #include "config.h"
 #include "radio.h"
 
-struct sdrstate {
-  struct frontend *frontend;
-
-  // Stuff for sending commands
-  void *phd;               // Opaque pointer to type hid_device
-
-  int number;
-
-  // Smoothed error estimates
-  complex float DC;      // DC offset
-  float sinphi;          // I/Q phase error
-  float imbalance;       // Ratio of I power to Q power
-  double calibration;    // TCXO Offset (0 = on frequency)
-
-  uint8_t bias_tee;
-  bool agc;             // enable/disable agc
-  float scale;          // Scale samples for #bits and front end gain
-
-  // portaudio parameters
-  PaStream *Pa_Stream;       // Portaudio handle
-  char sdr_name[50];         // name of associated audio device for A/D
-  int overrun;               // A/D overrun count
-  int overflows;
-
-  pthread_t proc_thread;
-};
-
 // constants, some of which you might want to tweak
+#define INPUT_PRIORITY 95
+
 static float const AGC_upper = -15;
 static float const AGC_lower = -50;
 static int const ADC_samprate = 192000;
@@ -65,6 +40,33 @@ static float const UpperEdge = +75000;
 // 240 samples @ 16 bit stereo = 960 bytes/packet; at 192 kHz, this is 1.25 ms (800 pkt/sec)
 static int Blocksize;
 static bool Hold_open = false;
+
+struct sdrstate {
+  struct frontend *frontend;
+
+  // Stuff for sending commands
+  void *phd;               // Opaque pointer to type hid_device
+
+  int number;
+
+  // Smoothed error estimates
+  float complex DC;      // DC offset
+  float sinphi;          // I/Q phase error
+  float imbalance;       // Ratio of I power to Q power
+  double calibration;    // TCXO Offset (0 = on frequency)
+
+  uint8_t bias_tee;
+  bool agc;             // enable/disable agc
+  float scale;          // Scale samples for #bits and front end gain
+
+  // portaudio parameters
+  PaStream *Pa_Stream;       // Portaudio handle
+  char sdr_name[50];         // name of associated audio device for A/D
+  int overrun;               // A/D overrun count
+  int overflows;
+
+  pthread_t proc_thread;
+};
 
 static char const *Funcube_keys[] = {
   "library",
@@ -212,7 +214,7 @@ static void *proc_funcube(void *arg){
   int ConsecPaErrs = 0;
   int16_t * sampbuf = malloc(2 * Blocksize * sizeof(*sampbuf)); // complex samples have two integers
 
-  realtime();
+  realtime(INPUT_PRIORITY);
 
   while(true){
     // Read block of I/Q samples from A/D converter
@@ -244,10 +246,10 @@ static void *proc_funcube(void *arg){
       ConsecPaErrs = 0;
 
     float i_energy=0, q_energy=0;
-    complex float samp_sum = 0;
+    float complex samp_sum = 0;
     float dotprod = 0;
 
-    complex float * wptr = frontend->in.input_write_pointer.c;
+    float complex * wptr = frontend->in.input_write_pointer.c;
 
     for(int i=0; i<Blocksize; i++){
       if(sampbuf[2*i] == 32767 || sampbuf[2*i] <= -32767){
@@ -262,7 +264,7 @@ static void *proc_funcube(void *arg){
       } else
 	frontend->samp_since_over++;
 
-      complex float samp = CMPLXF(sampbuf[2*i],sampbuf[2*i+1]);
+      float complex samp = CMPLXF(sampbuf[2*i],sampbuf[2*i+1]);
       samp_sum += samp; // Accumulate average DC values
       samp -= sdr->DC;   // remove smoothed DC offset (which can be fractional)
 
@@ -322,6 +324,7 @@ int funcube_startup(struct frontend *frontend){
   assert(sdr != NULL);
 
   // Start processing A/D data
+  sdr->scale = scale_AD(frontend);
   pthread_create(&sdr->proc_thread,NULL,proc_funcube,sdr);
   fprintf(stdout,"funcube running\n");
   return 0;

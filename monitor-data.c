@@ -34,6 +34,8 @@
 #include "status.h"
 #include "monitor.h"
 
+#define DATA_PRIORITY 50
+
 int Position; // auto-position streams
 int Invalids;
 
@@ -71,7 +73,7 @@ void *dataproc(void *arg){
 
   struct packet *pkt = NULL;
 
-  realtime();
+  realtime(DATA_PRIORITY);
   // Main loop begins here
   while(!Terminate){
     // Need a new packet buffer?
@@ -123,7 +125,7 @@ void *dataproc(void *arg){
       sp->notch_enable = Notch;
       sp->muted = Start_muted;
       sp->dest = mcast_address_text;
-      sp->next_timestamp = pkt->rtp.timestamp;
+      sp->rtp_state.timestamp = sp->next_timestamp = pkt->rtp.timestamp;
       sp->rtp_state.seq = pkt->rtp.seq;
       sp->reset = true;
       sp->init = true;
@@ -246,6 +248,7 @@ void *decode_task(void *arg){
 	sp->queue = pkt->next;
 	pthread_mutex_unlock(&sp->qmutex);
 	pkt->next = NULL;
+	sp->rtp_state.timestamp = pkt->rtp.timestamp; // used for delay calcs
 	sp->rtp_state.seq = pkt->rtp.seq + 1; // Expect the next seq # next time
 	if(consec_out_of_sequence >= 6)
 	  reset_session(sp,pkt->rtp.timestamp); // Updates sp->wptr
@@ -733,7 +736,7 @@ void reset_session(struct session * const sp,uint32_t timestamp){
 // Return true if we (re)started it
 bool kick_output(){
   bool restarted = false;
-  if(!Pa_IsStreamActive(Pa_Stream)){
+  if(!Pipe && !Pa_IsStreamActive(Pa_Stream)){
     // Start it up
     if(!Pa_IsStreamStopped(Pa_Stream))
       Pa_StopStream(Pa_Stream); // it was in limbo

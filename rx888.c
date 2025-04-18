@@ -28,6 +28,8 @@
 #include "rx888.h"
 #include "ezusb.h"
 
+#define INPUT_PRIORITY 95
+
 static int const Min_samprate =      1000000; // 1 MHz, in ltc2208 spec
 static int const Max_samprate =    130000000; // 130 MHz, in ltc2208 spec
 static int const Default_samprate = 64800000; // Synthesizes cleanly from 27 MHz reference
@@ -361,6 +363,7 @@ int rx888_startup(struct frontend * const frontend){
   struct sdrstate * const sdr = (struct sdrstate *)frontend->context;
 
   // Start processing A/D data
+  sdr->scale = scale_AD(frontend); // set scaling now that we know the forward FFT size
   pthread_create(&sdr->proc_thread,NULL,proc_rx888,sdr);
   pthread_create(&sdr->agc_thread,NULL,agc_rx888,sdr);
   fprintf(stdout,"rx888 running\n");
@@ -393,7 +396,8 @@ static void *proc_rx888(void *arg){
   assert(sdr != NULL);
   pthread_setname("proc_rx888");
 
-  realtime();
+  realtime(INPUT_PRIORITY);
+  stick_core();
   {
     int64_t const now = gps_time_ns();
     sdr->last_callback_time = now;
@@ -540,8 +544,8 @@ static void rx_callback(struct libusb_transfer * const transfer){
       } else {
 	frontend->samp_since_over++;
       }
+      in_energy += (int)samples[i] * samples[i];
       wptr[i] = sdr->scale * samples[i];
-      in_energy += samples[i] * samples[i];
     }
   }
   frontend->timestamp = now;

@@ -72,7 +72,7 @@ int demod_wfm(void *arg){
 	     chan->filter.max_IF/Composite_samprate,
 	     chan->filter.kaiser_beta);
 
-  chan->filter.remainder = NAN;
+  chan->filter.remainder = NAN; // Force re-init of fine oscillator
   set_freq(chan,chan->tune.freq); // Retune if necessary to accommodate edge of passband
 
   float phase_memory = 0;  // Demodulator input phase memory
@@ -114,10 +114,10 @@ int demod_wfm(void *arg){
   compute_tuning(composite_N,composite_M,Composite_samprate,&subc_shift,&subc_remainder,38000.);
   assert((subc_shift % 4) == 0 && subc_remainder == 0);
 
-  complex float stereo_deemph = 0;
+  float complex stereo_deemph = 0;
   float mono_deemph = 0;
 
-  realtime();
+  realtime(chan->prio);
 
   while(downconvert(chan) == 0){
     // Power squelch
@@ -140,7 +140,7 @@ int demod_wfm(void *arg){
       continue;
     }
     // Actual FM demodulation
-    complex float *buffer = chan->filter.out.output.c; // Working buffer
+    float complex *buffer = chan->filter.out.output.c; // Working buffer
     for(int n=0; n < composite_L; n++){
       // Although deviation can be zero, argf() is defined as returning 0, not NAN
       float np = M_1_PIf * cargf(buffer[n]); // -1 to +1
@@ -209,9 +209,9 @@ int demod_wfm(void *arg){
       execute_filter_output(&lminusr,subc_shift); // L-R composite spun down to 0 Hz, 48 kHz rate
 
       float complex stereo_buffer[audio_L];
-      float output_level = 0;
+      float output_energy = 0;
       for(int n = 0; n < audio_L; n++){
-	complex float subc_phasor = pilot.output.c[n]; // 19 kHz pilot
+	float complex subc_phasor = pilot.output.c[n]; // 19 kHz pilot
 	subc_phasor = (subc_phasor * subc_phasor) / cnrmf(subc_phasor); // square to 38 kHz and normalize
 	float subc_info = 2.0f * __imag__ (conjf(subc_phasor) * lminusr.output.c[n]); // Carrier is in quadrature
 	assert(!isnan(subc_info));
@@ -224,10 +224,10 @@ int demod_wfm(void *arg){
 	  s = stereo_deemph += chan->fm.rate * (chan->fm.gain * s - stereo_deemph);
 
 	stereo_buffer[n] = s * chan->output.gain;
-	output_level += cnrmf(stereo_buffer[n]);
+	output_energy += cnrmf(stereo_buffer[n]);
       }
-      output_level /= (2 * audio_L); // Halve power to get level per channel
-      chan->output.energy += output_level;
+      // Halve power to get level per channel
+      chan->output.power = output_energy / (2 * audio_L);
       if(send_output(chan,(const float *)stereo_buffer,audio_L,false) < 0)
 	break; // No output stream! Terminate
     } else { // pilot_present == false
@@ -236,23 +236,22 @@ int demod_wfm(void *arg){
 	chan->output.channels = 1;
 	chan->output.rtp.type = pt_from_info(chan->output.samprate,chan->output.channels,chan->output.encoding); // make sure it's initialized
       }
-      float output_level = 0;
+      float output_energy = 0;
       if(chan->fm.rate != 0){
 	// Apply deemphasis
 	for(int n=0; n < audio_L; n++){
 	  float s = mono_deemph += chan->fm.rate * (chan->fm.gain * mono.output.r[n] - mono_deemph);
 	  s *= chan->output.gain;
 	  mono.output.r[n] = s;
-	  output_level += s * s;
+	  output_energy += s * s;
 	}
       } else {
 	for(int n=0; n < audio_L; n++){
 	  float s = mono.output.r[n] *= chan->output.gain;
-	  output_level += s * s;
+	  output_energy += s * s;
 	}
       }
-      output_level /= audio_L;
-      chan->output.energy += output_level;
+      chan->output.power = output_energy / audio_L;
 
       if(send_output(chan,mono.output.r,audio_L,false) < 0)
 	break; // No output stream! Terminate

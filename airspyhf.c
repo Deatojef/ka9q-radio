@@ -26,6 +26,8 @@
 extern int Verbose;
 extern const char *App_path;
 
+#define INPUT_PRIORITY 95
+
 static float Power_smooth = 0.05; // Calculate this properly someday
 
 static char const *Airspyhf_keys[] = {
@@ -51,6 +53,7 @@ struct sdrstate {
 
   uint32_t sample_rates[20];
   uint64_t SN; // Serial number
+  float scale;
 
   pthread_t cmd_thread;
   pthread_t monitor_thread;
@@ -205,6 +208,7 @@ int airspyhf_setup(struct frontend * const frontend,dictionary * const Dictionar
 }
 int airspyhf_startup(struct frontend *frontend){
   struct sdrstate *sdr = (struct sdrstate *)frontend->context;
+  sdr->scale = scale_AD(frontend); // set scaling now that we know the forward FFT size
   pthread_create(&sdr->monitor_thread,NULL,airspyhf_monitor,sdr);
   return 0;
 }
@@ -214,7 +218,7 @@ static void *airspyhf_monitor(void *p){
   assert(sdr != NULL);
   pthread_setname("airspyhf-mon");
 
-  realtime();
+  realtime(INPUT_PRIORITY);
   int ret __attribute__ ((unused));
   ret = airspyhf_start(sdr->device,rx_callback,sdr);
   assert(ret == AIRSPYHF_SUCCESS);
@@ -244,7 +248,8 @@ static int rx_callback(airspyhf_transfer_t *transfer){
   if(!Name_set){
     pthread_setname("airspyhf-cb");
     Name_set = true;
-    realtime();    // See discussion in airspy.c
+    realtime(INPUT_PRIORITY);    // See discussion in airspy.c
+    stick_core();
   }
   if(transfer->dropped_samples){
     fprintf(stdout,"dropped %'lld\n",(long long)transfer->dropped_samples);
@@ -257,7 +262,7 @@ static int rx_callback(airspyhf_transfer_t *transfer){
   float in_energy = 0;
   for(int i=0; i < sampcount; i++){
     in_energy += cnrmf(up[i]);
-    wptr[i] = up[i];
+    wptr[i] = up[i] * sdr->scale;
   }
   frontend->samples += sampcount;
   frontend->timestamp = gps_time_ns();

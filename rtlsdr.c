@@ -22,6 +22,8 @@
 
 //#define REMOVE_DC 1
 
+#define INPUT_PRIORITY 95
+
 // Internal clock is 28.8 MHz, and 1.8 MHz * 16 = 28.8 MHz
 #define DEFAULT_SAMPRATE (1800000)
 
@@ -238,6 +240,8 @@ static void *rtlsdr_read_thread(void *arg){
   struct sdr *sdr = arg;
   struct frontend *frontend = sdr->frontend;
 
+  realtime(INPUT_PRIORITY);
+  stick_core();
   rtlsdr_reset_buffer(sdr->device);
   rtlsdr_read_async(sdr->device,rx_callback,frontend,0,16*16384); // blocks
 
@@ -248,6 +252,7 @@ static void *rtlsdr_read_thread(void *arg){
 
 int rtlsdr_startup(struct frontend * const frontend){
   struct sdr * const sdr = frontend->context;
+  sdr->scale = scale_AD(frontend); // set scaling now that we know the forward FFT size
   pthread_create(&sdr->read_thread,NULL,rtlsdr_read_thread,sdr);
   fprintf(stdout,"rtlsdr thread running\n");
   return 0;
