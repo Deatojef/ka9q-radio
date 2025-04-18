@@ -3,7 +3,7 @@
 // Functionally just an Rx-only igate. 
 // Process AX.25 frames containing APRS data, feed to APRS2 network
 //
-// Copyright 2017-2024 Phil Karn, KA9Q & Jeff Deaton, N6BA
+// Copyright 2017-2025 Phil Karn, KA9Q & Jeff Deaton, N0JD
 // Major revisions fall 2020, 2023, 2024 (really continuous revisions!)
 
 #define _GNU_SOURCE 1
@@ -49,7 +49,7 @@ void _writemessage(FILE *file, const char *fmt, ...);
 
 // borrowed from misc.h
 #define VERSION() { fprintf(stdout,"Igate. %s last modified %s\n",__FILE__,__TIMESTAMP__); \
-            fprintf(stdout,"Copyright 2023,2024, Phil Karn, KA9Q, Jeff Deaton, N6BA. May be used under the terms of the GNU Public License\n");}
+            fprintf(stdout,"Copyright 2023-2025, Phil Karn, KA9Q, Jeff Deaton, N0JD. May be used under the terms of the GNU Public License\n");}
 
 
 // structures for APRS telemetry data and station particulars

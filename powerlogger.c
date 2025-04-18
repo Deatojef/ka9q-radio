@@ -2,7 +2,7 @@
 //
 // This will log into the local database (postgresql), and save received power data as rows in that database.
 //
-// Copyright 2017-2024 Phil Karn, KA9Q & Jeff Deaton, N6BA
+// Copyright 2017-2025 Phil Karn, KA9Q & Jeff Deaton, N0JD
 // Major revisions fall 2020, 2023, 2024 (really continuous revisions!)
 
 #define _GNU_SOURCE 1
